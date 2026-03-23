@@ -112,7 +112,7 @@ class GQAAttention(nn.Module):
             attn_scores = attn_scores + attention_mask
         # 否则应用 causal mask
         else:
-            causal_mask = torch.full((seq_len, seq_len), float('-inf'), device=x.device)
+            causal_mask = torch.full((seq_len, seq_len), float('-inf'), device=x.device, dtype=x.dtype)
             causal_mask = torch.triu(causal_mask, diagonal=1)  # 上三角为 -inf，对角线及以下为 0
             attn_scores = attn_scores + causal_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
         # attn_probs: (B, num_heads, seq_len, seq_len)
