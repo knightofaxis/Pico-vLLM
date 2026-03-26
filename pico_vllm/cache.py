@@ -5,6 +5,8 @@ import torch
 from torch import Tensor, dtype
 
 class KVCache(ABC):  # 抽象接口
+
+    
     ''' update: 更新指定 layer 的 KV，输入是当前 step 计算出的 K 和 V，shape (num_heads, head_dim)
         get: 获取指定 layer 的 KV，返回 shape (num_heads, head_dim) 的 K 和 V
         reset: 重置 KV cache，清空所有 KV'''

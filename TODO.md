@@ -1,1 +1,4 @@
 1、model的GQAAttention中，freqs_cis相关的实现效率不高，需要优化
+2、model的GQAAttention中，所有的cat()相关的拼接效率很低而且会阻碍cudagraph的高效编译，需要优化
+3、在Continuous Batching中，考虑增量开发一个可以在同一个batch中对不同seq变长进行Attention计算的Kernel编写
+4、chunked prefill也许是一个可行的优化

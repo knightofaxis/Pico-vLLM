@@ -144,6 +144,8 @@ if __name__ == "__main__":
     model = Qwen25_15B(cfg)
     model = load_weights(model, "./weights")
     model = model.to(torch.bfloat16).to(device)
+    # this can increase performance by ~65%, but we are doing it ourself.
+    # model = torch.compile(model, mode="reduce-overhead") 
     tokenizer = AutoTokenizer.from_pretrained("./weights")
 
     # seq_len 从 16 到 4096，间隔 16
