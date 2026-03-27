@@ -13,6 +13,7 @@ class BlockManager:
                  num_gpu_blocks: int, 
                  num_cpu_blocks: int, 
                  block_size: int, 
+                 num_layers: int,
                  num_kv_heads: int, 
                  head_dim: int, 
                  dtype: dtype):
@@ -26,14 +27,14 @@ class BlockManager:
         # GPU pool
         self.gpu_free_blocks: deque[int] = deque(range(num_gpu_blocks))
         self.gpu_kv_cache = torch.zeros(
-            num_gpu_blocks, 2, num_kv_heads, block_size, head_dim,
+            2, num_layers, num_gpu_blocks, block_size, num_kv_heads, head_dim,
             device='cuda', dtype=dtype
         )
         
         # CPU pool（offload 目标）
         self.cpu_free_blocks: deque[int] = deque(range(num_cpu_blocks))
         self.cpu_kv_cache = torch.zeros(
-            num_cpu_blocks, 2, num_kv_heads, block_size, head_dim,
+            2, num_layers, num_cpu_blocks, block_size, num_kv_heads, head_dim,
             device='cpu', dtype=dtype,
             pin_memory=True  # ← 关键：pin_memory 让 CPU→GPU 传输更快
         )
@@ -47,7 +48,7 @@ class BlockManager:
         ]
         self.logical_free_blocks: deque[int] = deque(range(self.num_total_blocks))  # 逻辑块索引，初始全部空闲
     
-    def allocate(self, num_blocks: int) -> List[int]:
+    def allocate(self, num_blocks: int = 1) -> List[int]:
         # 分配 num_blocks 个物理块
         block_ids = []
         if num_blocks > self.num_free_blocks:
@@ -96,8 +97,8 @@ class BlockManager:
             if block_type != pagedblocktype.GPU:
                 raise RuntimeError(f"Block {block_id} is not on GPU, cannot swap out")
             cpu_block_id = self.cpu_free_blocks.popleft()
-            self.cpu_kv_cache[cpu_block_id].copy_(
-                self.gpu_kv_cache[physical_block_id], non_blocking=True
+            self.cpu_kv_cache[:,:,cpu_block_id].copy_(
+                self.gpu_kv_cache[:,:,physical_block_id], non_blocking=True
             )
             self.gpu_free_blocks.append(physical_block_id)  # GPU 块释放
             self.block_mapping[block_id] = (pagedblocktype.CPU, cpu_block_id)  # 更新映射
@@ -113,8 +114,8 @@ class BlockManager:
             if block_type != pagedblocktype.CPU:
                 raise RuntimeError(f"Block {block_id} is not on CPU, cannot swap in")
             gpu_block_id = self.gpu_free_blocks.popleft()
-            self.gpu_kv_cache[gpu_block_id].copy_(
-                self.cpu_kv_cache[physical_block_id], non_blocking=True
+            self.gpu_kv_cache[:,:,gpu_block_id].copy_(
+                self.cpu_kv_cache[:,:,physical_block_id], non_blocking=True
             )
             self.cpu_free_blocks.append(physical_block_id)  # CPU 块释放
             self.block_mapping[block_id] = (pagedblocktype.GPU, gpu_block_id)  # 更新映射
@@ -142,6 +143,7 @@ if __name__ == "__main__":
         num_gpu_blocks=4,
         num_cpu_blocks=2,
         block_size=4,
+        num_layers=2,
         num_kv_heads=2,
         head_dim=8,
         dtype=torch.float16,
@@ -175,8 +177,8 @@ if __name__ == "__main__":
     lid = ids_a[0]
     btype, pid = bm.block_mapping[lid]
     # 写入一个可识别的值
-    bm.gpu_kv_cache[pid, 0, 0, 0, 0] = 42.0
-    assert bm.gpu_kv_cache[pid, 0, 0, 0, 0].item() == 42.0
+    bm.gpu_kv_cache[0, 0, pid, 0, 0, 0] = 42.0
+    assert bm.gpu_kv_cache[0, 0, pid, 0, 0, 0].item() == 42.0
     print(f"  逻辑块 {lid} → 物理GPU块 {pid}，写入42.0 ✓")
 
     # ===== 测试4：swap_out =====
@@ -193,7 +195,7 @@ if __name__ == "__main__":
     # 验证数据被正确拷贝到 CPU
     lid = ids_a[0]
     _, cpu_pid = bm.block_mapping[lid]
-    assert bm.cpu_kv_cache[cpu_pid, 0, 0, 0, 0].item() == 42.0
+    assert bm.cpu_kv_cache[0, 0, cpu_pid, 0, 0, 0].item() == 42.0
     print(f"  swap_out 后数据正确，GPU块已释放 ✓")
 
     # ===== 测试5：swap_in =====
@@ -208,7 +210,7 @@ if __name__ == "__main__":
     # 验证数据完整性
     lid = ids_a[0]
     _, gpu_pid = bm.block_mapping[lid]
-    assert bm.gpu_kv_cache[gpu_pid, 0, 0, 0, 0].item() == 42.0
+    assert bm.gpu_kv_cache[0, 0, gpu_pid, 0, 0, 0].item() == 42.0
     print(f"  swap_in 后数据正确，CPU块已释放 ✓")
 
     # ===== 测试6：free =====
