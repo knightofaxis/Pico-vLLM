@@ -149,8 +149,8 @@ class PagedKVCache(KVCache):
             offset_t = block_offsets[idx_t]
 
             # 批量写入 GPU
-            self.block_manager.gpu_kv_cache[0, layer_idx, phys_t, offset_t, :, :] = k[idx_t]
-            self.block_manager.gpu_kv_cache[1, layer_idx, phys_t, offset_t, :, :] = v[idx_t]
+            self.block_manager.gpu_kv_cache[0, layer_idx, phys_t, :, offset_t, :] = k[idx_t]
+            self.block_manager.gpu_kv_cache[1, layer_idx, phys_t, :, offset_t, :] = v[idx_t]
 
         if cpu_indices:
             # 转换为 Tensor，注意放在 CPU 上
@@ -159,8 +159,8 @@ class PagedKVCache(KVCache):
             offset_t_cpu = block_offsets[idx_t_cpu].cpu()
 
             # 批量写入 CPU (附带 to('cpu') 数据转移)
-            self.block_manager.cpu_kv_cache[0, layer_idx, phys_t_cpu, offset_t_cpu, :, :] = k[idx_t_cpu].to('cpu')
-            self.block_manager.cpu_kv_cache[1, layer_idx, phys_t_cpu, offset_t_cpu, :, :] = v[idx_t_cpu].to('cpu')
+            self.block_manager.cpu_kv_cache[0, layer_idx, phys_t_cpu, :, offset_t_cpu, :] = k[idx_t_cpu].to('cpu')
+            self.block_manager.cpu_kv_cache[1, layer_idx, phys_t_cpu, :, offset_t_cpu, :] = v[idx_t_cpu].to('cpu')
 
         # 如果出现未知类型，抛出异常
         if len(gpu_indices) + len(cpu_indices) != prefill_len:
@@ -227,13 +227,13 @@ class PagedKVCache(KVCache):
         if block_type == pagedblocktype.GPU:
             # 使用 .view() 或 .squeeze() 确保维度对齐: (num_heads, head_dim)
             # 物理 cache 维度: [2, num_layers, num_blocks, block_size, num_heads, head_dim]
-            self.block_manager.gpu_kv_cache[0, layer_idx, physical_id, block_offset, :, :] = k.squeeze(0)
-            self.block_manager.gpu_kv_cache[1, layer_idx, physical_id, block_offset, :, :] = v.squeeze(0)
+            self.block_manager.gpu_kv_cache[0, layer_idx, physical_id, :, block_offset, :] = k.squeeze(0)
+            self.block_manager.gpu_kv_cache[1, layer_idx, physical_id, :, block_offset, :] = v.squeeze(0)
         elif block_type == pagedblocktype.CPU:
             # 如果逻辑块在 CPU，这里会产生严重的同步开销，通常做法是：
             # 在 update 之前由 BlockManager 确保活跃块已被 swap-in 到 GPU
-            self.block_manager.cpu_kv_cache[0, layer_idx, physical_id, block_offset, :, :] = k.squeeze(0).to('cpu')
-            self.block_manager.cpu_kv_cache[1, layer_idx, physical_id, block_offset, :, :] = v.squeeze(0).to('cpu')
+            self.block_manager.cpu_kv_cache[0, layer_idx, physical_id, :, block_offset, :] = k.squeeze(0).to('cpu')
+            self.block_manager.cpu_kv_cache[1, layer_idx, physical_id, :, block_offset, :] = v.squeeze(0).to('cpu')
         else:
             raise RuntimeError(f"尝试写入未分配物理空间的逻辑块: {logical_block_id}")
         

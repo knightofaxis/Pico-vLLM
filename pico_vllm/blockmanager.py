@@ -27,14 +27,14 @@ class BlockManager:
         # GPU pool
         self.gpu_free_blocks: deque[int] = deque(range(num_gpu_blocks))
         self.gpu_kv_cache = torch.zeros(
-            2, num_layers, num_gpu_blocks, block_size, num_kv_heads, head_dim,
+            2, num_layers, num_gpu_blocks, num_kv_heads, block_size, head_dim,
             device='cuda', dtype=dtype
         )
         
         # CPU pool（offload 目标）
         self.cpu_free_blocks: deque[int] = deque(range(num_cpu_blocks))
         self.cpu_kv_cache = torch.zeros(
-            2, num_layers, num_cpu_blocks, block_size, num_kv_heads, head_dim,
+            2, num_layers, num_cpu_blocks, num_kv_heads, block_size, head_dim,
             device='cpu', dtype=dtype,
             pin_memory=True  # ← 关键：pin_memory 让 CPU→GPU 传输更快
         )

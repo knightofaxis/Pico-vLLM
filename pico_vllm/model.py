@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from cache import KVCache, NaiveKVCache, PagedKVCache
+from Attention import paged_decode_attention
 
 @dataclass
 class ModelConfig:
@@ -18,6 +19,9 @@ class ModelConfig:
     rope_theta: float = 1000000.0
     max_position_embeddings: int = 131072
     tie_word_embeddings: bool = True
+
+    BLOCK_SIZE = 16 # 目前硬编码为固定值
+    MAX_BLOCKS_PER_SEQ = max_position_embeddings // BLOCK_SIZE  # 固定值，启动时确定
 
     @property
     def head_dim(self):
@@ -138,7 +142,23 @@ class GQAAttention(nn.Module):
                       context_lens: Tensor, # (B,)
                       ) -> Tensor:  # (B, 1, hidden)
         # TODO: 换成 Triton kernel
-        return self._gather_decode_attention(q, k, v, kv_caches, block_table, context_lens)
+            # 写入 KV cache
+        for i, cache in enumerate(kv_caches):
+            cache.update(self.layer_idx, k[i].squeeze(0), v[i].squeeze(0))
+
+        bm = kv_caches[0].block_manager
+        k_cache = bm.gpu_kv_cache[0, self.layer_idx]  # 或 bm.gpu_kv_cache[0, self.layer_idx]
+        v_cache = bm.gpu_kv_cache[1, self.layer_idx]
+        
+        out = paged_decode_attention(
+            q, k_cache, v_cache,
+            block_table, context_lens,
+            MAX_BLOCKS_PER_SEQ=block_table.shape[1],
+        )
+        # out: (B, N_HEAD, 1, HEAD_DIM) → (B, 1, hidden_size)
+        B = q.shape[0]
+        return out.transpose(1, 2).contiguous().view(B, 1, self.cfg.hidden_size)
+        # return self._gather_decode_attention(q, k, v, kv_caches, block_table, context_lens)
 
     def _gather_decode_attention(self, q, k, v, kv_caches: list[PagedKVCache], block_table: Tensor, context_lens: Tensor):
         # 临时 gather 实现，后面换 Triton
@@ -153,39 +173,123 @@ class GQAAttention(nn.Module):
         
         # 从 block_manager 的全局 kv_cache 里按 block_table gather
         bm = kv_caches[0].block_manager
-        # gpu_kv_cache: (k/v, num_layers, num_blocks, block_size, n_kv_heads, head_dim)
+        # gpu_kv_cache: (k/v, num_layers, num_blocks, n_kv_heads, block_size, head_dim)
         # k_global: (num_blocks, block_size, n_kv_heads, head_dim)
-        k_global = bm.gpu_kv_cache[0, self.layer_idx]  # (num_blocks, block_size, n_kv_heads, head_dim)
+        k_global = bm.gpu_kv_cache[0, self.layer_idx]  # (num_blocks, n_kv_heads, block_size, head_dim)
         v_global = bm.gpu_kv_cache[1, self.layer_idx]
         
         outputs = []
         for i in range(B):
-            seq_len = context_lens[i].item() + 1
+            seq_len = context_lens[i].item()
             num_blocks = (seq_len + block_size - 1) // block_size
             phys_blocks = block_table[i, :num_blocks]  # (num_blocks,) 物理 block id
             
-            # gather: (num_blocks, block_size, n_kv_heads, head_dim)
-            # k_global[phys_blocks]: (block_size, n_kv_heads, head_dim)
-            k_i = k_global[phys_blocks].reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)[:seq_len]
-            v_i = v_global[phys_blocks].reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)[:seq_len]
+            # # gather: (num_blocks, n_kv_heads, block_size, head_dim)
+            # # k_global[phys_blocks]: (n_kv_heads, block_size, head_dim)
+            # k_i = k_global[phys_blocks].transpose(0, 1).reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)[:seq_len]
+            # v_i = v_global[phys_blocks].transpose(0, 1).reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)[:seq_len]
             
-            # GQA expand
-            # (seq_len, n_kv_heads, head_dim)->(seq_len, n_heads, head_dim)
-            k_i = k_i.repeat_interleave(self.cfg.num_kv_groups, dim=1)  # (seq_len, n_heads, head_dim)
-            v_i = v_i.repeat_interleave(self.cfg.num_kv_groups, dim=1)
+            # # GQA expand
+            # # (seq_len, n_kv_heads, head_dim)->(seq_len, n_heads, head_dim)
+            # k_i = k_i.repeat_interleave(self.cfg.num_kv_groups, dim=1)  # (seq_len, n_heads, head_dim)
+            # v_i = v_i.repeat_interleave(self.cfg.num_kv_groups, dim=1)
             
-            # SDPA: (1, n_heads, 1, head_dim) x (1, n_heads, seq_len, head_dim)
-            # q[i]: (1, n_heads, head_dim)
-            q_i = q[i].transpose(0, 1).unsqueeze(0)  # (1, n_heads, 1, head_dim)
-            k_i = k_i.transpose(0, 1).unsqueeze(0)   # (1, n_heads, seq_len, head_dim)
-            v_i = v_i.transpose(0, 1).unsqueeze(0)
+            # # SDPA: (1, n_heads, 1, head_dim) x (1, n_heads, seq_len, head_dim)
+            # # q[i]: (1, n_heads, head_dim)
+            # q_i = q[i].transpose(0, 1).unsqueeze(0)  # (1, n_heads, 1, head_dim)
+            # k_i = k_i.transpose(0, 1).unsqueeze(0)   # (1, n_heads, seq_len, head_dim)
+            # v_i = v_i.transpose(0, 1).unsqueeze(0)
             
+            # out_i = F.scaled_dot_product_attention(q_i, k_i, v_i, is_causal=False)
+
+            # k_global[phys_blocks]: (num_blocks_i, n_kv_heads, block_size, head_dim)
+
+            # 目标：(1, n_heads, seq_len, head_dim) 供 SDPA 使用
+
+            # 合并 num_blocks_i 和 block_size 两个维度，截断到 seq_len
+            # (num_blocks_i, n_kv_heads, block_size, head_dim)
+            # → (n_kv_heads, num_blocks_i * block_size, head_dim)  permute
+            # → (n_kv_heads, seq_len, head_dim)                    截断
+            # → (n_heads, seq_len, head_dim)                       GQA expand
+            # → (1, n_heads, seq_len, head_dim)                    unsqueeze
+
+            k_i = k_global[phys_blocks].permute(1, 0, 2, 3) \
+                .reshape(self.cfg.num_key_value_heads, -1, self.cfg.head_dim)[:, :seq_len, :] \
+                .repeat_interleave(self.cfg.num_kv_groups, dim=0) \
+                .unsqueeze(0)
+
+            v_i = v_global[phys_blocks].permute(1, 0, 2, 3) \
+                .reshape(self.cfg.num_key_value_heads, -1, self.cfg.head_dim)[:, :seq_len, :] \
+                .repeat_interleave(self.cfg.num_kv_groups, dim=0) \
+                .unsqueeze(0)
+
+            # q[i]: (1, n_heads, head_dim) → (1, n_heads, 1, head_dim)
+            q_i = q[i].unsqueeze(2)  # unsqueeze seq 维度
+
             out_i = F.scaled_dot_product_attention(q_i, k_i, v_i, is_causal=False)
+
             # decode 不需要 causal mask，新 token attend to 所有历史
             outputs.append(out_i)  # (1, n_heads, 1, head_dim)
         
         out = torch.cat(outputs, dim=0)  # (B, n_heads, 1, head_dim)
         return out.transpose(1, 2).contiguous().view(B, 1, self.cfg.hidden_size)
+    
+    # def _gather_decode_attention(self, q, k, v, kv_caches, block_table, context_lens):
+    #     B = q.shape[0]
+    #     block_size = kv_caches[0].block_manager.block_size
+    #     bm = kv_caches[0].block_manager
+    #     n_kv_heads = self.cfg.num_key_value_heads
+    #     head_dim = self.cfg.head_dim
+
+    #     # 1. 写入 KV cache（仍然逐个，因为每个请求的 cache 对象独立）
+    #     for i, cache in enumerate(kv_caches):
+    #         cache.update(self.layer_idx, k[i].squeeze(0), v[i].squeeze(0))
+
+    #     # 2. 确定 padding 目标长度
+    #     max_seq_len = context_lens.max().item()
+    #     max_blocks = (max_seq_len + block_size - 1) // block_size
+
+    #     # 3. 向量化 gather
+    #     # block_table: (B, max_blocks_total)，取前 max_blocks 列
+    #     # -1 表示未分配，clamp 到 0 避免越界，后面用 mask 屏蔽
+    #     safe_blocks = block_table[:, :max_blocks].clamp(min=0)  # (B, max_blocks)
+
+    #     k_global = bm.gpu_kv_cache[0, self.layer_idx]  # (num_blocks, block_size, n_kv_heads, head_dim)
+    #     v_global = bm.gpu_kv_cache[1, self.layer_idx]
+
+    #     # (B, max_blocks, block_size, n_kv_heads, head_dim)
+    #     k_gathered = k_global[safe_blocks]
+    #     v_gathered = v_global[safe_blocks]
+
+    #     # (B, max_blocks * block_size, n_kv_heads, head_dim) → 截到 max_seq_len
+    #     k_gathered = k_gathered.reshape(B, -1, n_kv_heads, head_dim)[:, :max_seq_len]
+    #     v_gathered = v_gathered.reshape(B, -1, n_kv_heads, head_dim)[:, :max_seq_len]
+
+    #     # 4. GQA expand
+    #     # (B, max_seq_len, n_heads, head_dim)
+    #     k_gathered = k_gathered.repeat_interleave(self.cfg.num_kv_groups, dim=2)
+    #     v_gathered = v_gathered.repeat_interleave(self.cfg.num_kv_groups, dim=2)
+
+    #     # 5. 转置成 SDPA 期望格式
+    #     # (B, n_heads, 1, head_dim)
+    #     q_t = q.transpose(1, 2)
+    #     # (B, n_heads, max_seq_len, head_dim)
+    #     k_t = k_gathered.transpose(1, 2)
+    #     v_t = v_gathered.transpose(1, 2)
+
+    #     # 6. 构造 padding mask
+    #     # positions: (1, max_seq_len)
+    #     positions = torch.arange(max_seq_len, device=q.device).unsqueeze(0)
+    #     # pad_mask: (B, max_seq_len)，True 表示需要屏蔽（超出 context_lens 的位置）
+    #     pad_mask = positions >= context_lens.unsqueeze(1)
+    #     # attn_bias: (B, 1, 1, max_seq_len)
+    #     attn_bias = torch.zeros(B, 1, 1, max_seq_len, dtype=q.dtype, device=q.device)
+    #     attn_bias.masked_fill_(pad_mask.unsqueeze(1).unsqueeze(1), float('-inf'))
+
+    #     # 7. 单次 batched SDPA
+    #     out = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_bias)
+    #     # (B, n_heads, 1, head_dim) → (B, 1, hidden_size)
+    #     return out.transpose(1, 2).contiguous().view(B, 1, self.cfg.hidden_size)
     
     def _triton_decode_attention(self, q, k, v, k_cache, v_cache, block_table, context_lens):
         """
@@ -313,15 +417,22 @@ class Qwen25_15B(nn.Module):
                 
             # 构造 block_table
             max_blocks = max(c.allocated_cache_block_num for c in kv_caches)
+            # block_table = torch.full(
+            #     (B, max_blocks), -1, dtype=torch.int32, device=x.device
+            # )
             block_table = torch.full(
-                (B, max_blocks), -1, dtype=torch.int32, device=x.device
+                (B, self.cfg.MAX_BLOCKS_PER_SEQ), -1,
+                dtype=torch.int32, device=x.device
             )
+            for i, c in enumerate(kv_caches):
+                bt = c.get_block_table()
+                block_table[i, :len(bt)] = bt
             for i, c in enumerate(kv_caches):
                 bt = c.get_block_table()  # (allocated_blocks,)
                 block_table[i, :len(bt)] = bt
 
             context_lens = torch.tensor(
-                [c.seq_len for c in kv_caches],
+                [c.seq_len + 1 for c in kv_caches],
                 dtype=torch.int32, device=x.device
             )  # (B,)
 
