@@ -24,16 +24,29 @@ def load_weights(model, weight_dir: str):
         layer = model.layers[i]
         p = f"model.layers.{i}"
 
-        layer.attn.q_proj.weight.data = state_dict[f"{p}.self_attn.q_proj.weight"]
-        layer.attn.q_proj.bias.data   = state_dict[f"{p}.self_attn.q_proj.bias"]
-        layer.attn.k_proj.weight.data = state_dict[f"{p}.self_attn.k_proj.weight"]
-        layer.attn.k_proj.bias.data   = state_dict[f"{p}.self_attn.k_proj.bias"]
-        layer.attn.v_proj.weight.data = state_dict[f"{p}.self_attn.v_proj.weight"]
-        layer.attn.v_proj.bias.data   = state_dict[f"{p}.self_attn.v_proj.bias"]
+        # layer.attn.q_proj.weight.data = state_dict[f"{p}.self_attn.q_proj.weight"]
+        # layer.attn.q_proj.bias.data   = state_dict[f"{p}.self_attn.q_proj.bias"]
+        # layer.attn.k_proj.weight.data = state_dict[f"{p}.self_attn.k_proj.weight"]
+        # layer.attn.k_proj.bias.data   = state_dict[f"{p}.self_attn.k_proj.bias"]
+        # layer.attn.v_proj.weight.data = state_dict[f"{p}.self_attn.v_proj.weight"]
+        # layer.attn.v_proj.bias.data   = state_dict[f"{p}.self_attn.v_proj.bias"]
         layer.attn.o_proj.weight.data = state_dict[f"{p}.self_attn.o_proj.weight"]
+        # weights.py 里对每一层
+        q_w = state_dict[f"{p}.self_attn.q_proj.weight"]  # (q_size, hidden)
+        k_w = state_dict[f"{p}.self_attn.k_proj.weight"]  # (k_size, hidden)
+        v_w = state_dict[f"{p}.self_attn.v_proj.weight"]  # (v_size, hidden)
+        layer.attn.qkv_proj.weight.data = torch.cat([q_w, k_w, v_w], dim=0)
 
-        layer.ffn.gate_proj.weight.data = state_dict[f"{p}.mlp.gate_proj.weight"]
-        layer.ffn.up_proj.weight.data   = state_dict[f"{p}.mlp.up_proj.weight"]
+        q_b = state_dict[f"{p}.self_attn.q_proj.bias"]
+        k_b = state_dict[f"{p}.self_attn.k_proj.bias"]
+        v_b = state_dict[f"{p}.self_attn.v_proj.bias"]
+        layer.attn.qkv_proj.bias.data = torch.cat([q_b, k_b, v_b], dim=0)
+
+        # layer.ffn.gate_proj.weight.data = state_dict[f"{p}.mlp.gate_proj.weight"]
+        # layer.ffn.up_proj.weight.data   = state_dict[f"{p}.mlp.up_proj.weight"]
+        gate_w = state_dict[f"{p}.mlp.gate_proj.weight"]  # (q_size, hidden)
+        up_w = state_dict[f"{p}.mlp.up_proj.weight"]  # (k_size, hidden)
+        layer.ffn.gate_up_proj.weight.data = torch.cat([gate_w, up_w], dim=0)
         layer.ffn.down_proj.weight.data = state_dict[f"{p}.mlp.down_proj.weight"]
 
         layer.norm1.weight.data = state_dict[f"{p}.input_layernorm.weight"]

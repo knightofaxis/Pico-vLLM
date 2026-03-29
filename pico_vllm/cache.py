@@ -9,17 +9,17 @@ import math
 
 class KVCache(ABC):  # 抽象接口
     
-    ''' update: 更新指定 layer 的 KV，输入是当前 step 计算出的 K 和 V，shape (num_heads, head_dim)
-        get: 获取指定 layer 的 KV，返回 shape (num_heads, head_dim) 的 K 和 V
-        reset: 重置 KV cache，清空所有 KV'''
-    @abstractmethod
-    def update(self, layer_idx: int, k: Tensor, v: Tensor) -> None:
-        """
-        将新的 k/v 写入 cache
-        k, v: (1, num_kv_heads, head_dim)        ← decode 时
-           或 (seq_len, num_kv_heads, head_dim)   ← prefill 时
-        """
-        ...
+    # ''' update: 更新指定 layer 的 KV，输入是当前 step 计算出的 K 和 V，shape (num_heads, head_dim)
+    #     get: 获取指定 layer 的 KV，返回 shape (num_heads, head_dim) 的 K 和 V
+    #     reset: 重置 KV cache，清空所有 KV'''
+    # @abstractmethod
+    # def update(self, layer_idx: int, k: Tensor, v: Tensor) -> None:
+    #     """
+    #     将新的 k/v 写入 cache
+    #     k, v: (1, num_kv_heads, head_dim)        ← decode 时
+    #        或 (seq_len, num_kv_heads, head_dim)   ← prefill 时
+    #     """
+    #     ...
     # @abstractmethod
     # def get(self, layer_idx: int) -> tuple[Tensor, Tensor]:
     #     """
@@ -76,7 +76,7 @@ class NaiveKVCache(KVCache):
         return self._seq_len
 
 # 分页的page Attention用的kv cache管理
-class PagedKVCache(KVCache):
+class PagedKVCache():
     # block table + 物理块
     # max_block_len: int          # 最大的block数量
     def __init__(self, 
@@ -100,7 +100,7 @@ class PagedKVCache(KVCache):
         self._seq_len = 0  # 当前已填入的长度
         self._updated_layer = 0 # 当前已填入的layer数量
 
-    def prefill_update(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
+    def prefill_update(self, layer_idx: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         """
         一次性把 Prefill 阶段生成的全部 k/v 写入 block_manager
         k, v: (seq_len, num_kv_heads, head_dim)
@@ -185,7 +185,7 @@ class PagedKVCache(KVCache):
                 self.cache_block_index[self.allocated_cache_block_num + i] = logical_id
             self.allocated_cache_block_num += diff
 
-    def update(self, layer_idx: int, k: Tensor, v: Tensor) -> None:
+    def update(self, layer_idx: Tensor, k: Tensor, v: Tensor) -> None:
         """
         把新的 k/v 写入 block_manager 的物理 KV cache
         k, v: (seq_len, num_kv_heads, head_dim)
@@ -253,7 +253,44 @@ class PagedKVCache(KVCache):
             physical_ids.append(pid)
         return torch.tensor(physical_ids, dtype=torch.int32, device=self.device)
         
-
+    def get_prefill_slot_mapping(self, prefill_len: int) -> torch.Tensor:
+        """
+        计算本次 prefill 的 slot_mapping
+        prefill_len: 本次 prefill 的 token 数
+        """
+        slots = []
+        for i in range(prefill_len):
+            token_pos = self._seq_len + i
+            block_idx = token_pos // self.block_manager.block_size
+            offset = token_pos % self.block_manager.block_size
+            logical_id = self.cache_block_index[block_idx]
+            _, physical_id = self.block_manager.block_mapping[logical_id]
+            slot = physical_id * self.block_manager.block_size + offset
+            slots.append(slot)
+        return torch.tensor(slots, dtype=torch.int32, device=self.device)
+    
+    def _allocate_for_prefill(self, prefill_len: int) -> None:
+        """提前分配 prefill 需要的所有 block"""
+        total_needed = math.ceil((self._seq_len + prefill_len) / self.block_manager.block_size)
+        diff = total_needed - self.allocated_cache_block_num
+        if diff > 0:
+            new_blocks = self.block_manager.allocate(diff)
+            # 写入 cache_block_index（根据你用 list 还是 tensor 选对应写法）
+            for i, logical_id in enumerate(new_blocks):
+                self.cache_block_index[self.allocated_cache_block_num + i] = logical_id
+            self.allocated_cache_block_num += diff
+            
+    def get_decode_slot(self) -> int:
+        """
+        返回 decode 新 token 的物理 slot（已经过 prepare_decode_step）
+        """
+        token_pos = self._seq_len  # prepare_decode_step 之后，block 已分配
+        block_idx = token_pos // self.block_manager.block_size
+        offset = token_pos % self.block_manager.block_size
+        logical_id = self.cache_block_index[block_idx]
+        _, physical_id = self.block_manager.block_mapping[logical_id]
+        return physical_id * self.block_manager.block_size + offset
+    
     def reset(self) -> None:
         """
         释放所有 block，归还给 block_manager
@@ -334,7 +371,7 @@ if __name__ == "__main__":
 
     # 写入所有层
     for layer in range(NUM_LAYERS):
-        cache.prefill_update(layer, k_prefill, v_prefill)
+        cache.prefill_update(torch.tensor(layer), k_prefill, v_prefill)
 
     assert cache.seq_len == PREFILL_LEN
     assert cache._updated_layer == 0
@@ -361,7 +398,7 @@ if __name__ == "__main__":
     v_decode = torch.ones(1, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) * 88
 
     for layer in range(NUM_LAYERS):
-        cache.update(layer, k_decode, v_decode)
+        cache.update(torch.tensor(layer), k_decode, v_decode)
 
     assert cache.seq_len == PREFILL_LEN + 1  # 7
     # token 6 → block_idx=1, offset=2
@@ -378,13 +415,13 @@ if __name__ == "__main__":
     # 写到 token 7（还在 block 1 内），token 8 会进入 block 2
     for _ in range(8 - cache.seq_len):  # 补齐到 token 7
         for layer in range(NUM_LAYERS):
-            cache.update(layer, k_decode, v_decode)
+            cache.update(torch.tensor(layer), k_decode, v_decode)
 
     assert cache.allocated_cache_block_num == 2  # 还是 2 块
 
     # 写 token 8，触发第 3 块分配
     for layer in range(NUM_LAYERS):
-        cache.update(layer, k_decode, v_decode)
+        cache.update(torch.tensor(layer), k_decode, v_decode)
 
     assert cache.allocated_cache_block_num == 3
     print(f"  token 8 触发新 block 分配，allocated={cache.allocated_cache_block_num} ✓")
@@ -419,7 +456,7 @@ if __name__ == "__main__":
     k2 = torch.ones(3, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) * 42
     v2 = k2.clone()
     for layer in range(NUM_LAYERS):
-        cache.prefill_update(layer, k2, v2)
+        cache.prefill_update(torch.tensor(layer), k2, v2)
     assert cache.seq_len == 3
     print(f"  reset 后重新写入正确 ✓")
 

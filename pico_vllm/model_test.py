@@ -84,13 +84,28 @@ input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
 seq_len = input_ids.shape[1]
 
 cache = make_paged_cache()
+seq_len = input_ids.shape[1]
 
-# 做一次 prefill forward
+# 新接口
+cache._allocate_for_prefill(seq_len)
+slot_mapping = cache.get_prefill_slot_mapping(seq_len)
+position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
+
 with torch.no_grad():
-    logits = model(input_ids, kv_caches=[cache], is_prefill=True)
+    logits = model(
+        input_ids,
+        kv_cache_k=bm.gpu_kv_cache[0],
+        kv_cache_v=bm.gpu_kv_cache[1],
+        position_ids=position_ids,
+        slot_mapping=slot_mapping,
+        is_prefill=True,
+    )
+
+# 手动更新 seq_len
+cache._seq_len += seq_len
 
 assert logits.shape == (1, seq_len, cfg.vocab_size)
-assert cache.seq_len == seq_len, f"prefill 后 seq_len 应为 {seq_len}，实际 {cache.seq_len}"
+assert cache.seq_len == seq_len, f"prefill 后 seq_len 应为 {seq_len}，实际 {cache.seq_len}" 
 assert cache.allocated_cache_block_num == (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
 
 next_token = logits[0, -1].argmax().item()
@@ -107,9 +122,30 @@ print("测试三：GQAAttention decode 单步")
 print("=" * 60)
 
 decode_input = torch.tensor([[next_token]], dtype=torch.long, device=device)  # (1, 1)
+cache.prepare_decode_step()
+slot = cache.get_decode_slot()
+slot_mapping = torch.tensor([slot], dtype=torch.int32, device=device)
+position_ids = torch.tensor([[cache.seq_len]], dtype=torch.long, device=device)
+
+block_table = torch.full((1, cfg.MAX_BLOCKS_PER_SEQ), -1, dtype=torch.int32, device=device)
+bt = cache.get_block_table()
+block_table[0, :len(bt)] = bt
+
+context_lens = torch.tensor([cache.seq_len + 1], dtype=torch.int32, device=device)
 
 with torch.no_grad():
-    logits2 = model(decode_input, kv_caches=[cache], is_prefill=False)
+    logits2 = model(
+        decode_input,
+        kv_cache_k=bm.gpu_kv_cache[0],
+        kv_cache_v=bm.gpu_kv_cache[1],
+        position_ids=position_ids,
+        slot_mapping=slot_mapping,
+        is_prefill=False,
+        block_table=block_table,
+        context_lens=context_lens,
+    )
+
+cache._seq_len += 1
 
 assert logits2.shape == (1, 1, cfg.vocab_size)
 assert cache.seq_len == seq_len + 1, f"decode 后 seq_len 应为 {seq_len+1}，实际 {cache.seq_len}"
@@ -127,6 +163,78 @@ del cache
 print("\n" + "=" * 60)
 print("测试四：完整生成，对比 Paged 和参考输出")
 print("=" * 60)
+def run_paged_generate(input_ids, cache, max_new=20):
+    generated = input_ids[0].tolist()
+    seq_len = input_ids.shape[1]
+
+    # prefill
+    cache._allocate_for_prefill(seq_len)
+    slot_mapping = cache.get_prefill_slot_mapping(seq_len)
+    position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
+
+    with torch.no_grad():
+        logits = model(
+            input_ids,
+            kv_cache_k=bm.gpu_kv_cache[0],
+            kv_cache_v=bm.gpu_kv_cache[1],
+            position_ids=position_ids,
+            slot_mapping=slot_mapping,
+            is_prefill=True,
+        )
+    cache._seq_len += seq_len
+    next_id = logits[0, -1].argmax().item()
+    generated.append(next_id)
+
+    # decode loop
+    for step in range(max_new - 1):
+        cache.prepare_decode_step()
+        slot = cache.get_decode_slot()
+        slot_mapping = torch.tensor([slot], dtype=torch.int32, device=device)
+
+        # print(f"=== decode step {step}, _seq_len={cache._seq_len}, slot={slot} ===")
+        position_ids = torch.tensor([[cache.seq_len]], dtype=torch.long, device=device)
+
+        block_table = torch.full(
+            (1, cfg.MAX_BLOCKS_PER_SEQ), -1, dtype=torch.int32, device=device
+        )
+        bt = cache.get_block_table()
+        block_table[0, :len(bt)] = bt
+        context_lens = torch.tensor([cache.seq_len + 1], dtype=torch.int32, device=device)
+
+        # print(f"_seq_len={cache._seq_len}")
+        # print(f"position_ids={position_ids.tolist()}")
+        # print(f"context_lens={context_lens.tolist()}")
+        # print(f"slot={slot}")
+
+        dec_input = torch.tensor([[next_id]], device=device)
+        with torch.no_grad():
+            logits = model(
+                dec_input,
+                kv_cache_k=bm.gpu_kv_cache[0],
+                kv_cache_v=bm.gpu_kv_cache[1],
+                position_ids=position_ids,
+                slot_mapping=slot_mapping,
+                is_prefill=False,
+                block_table=block_table,
+                context_lens=context_lens,
+            )
+
+        # # decode 读取时：打印 gather 会读哪些 slot，对应的值是什么
+        # forward 之后验证 decode 新 token 是否写入
+        if step == 0:
+            # 用完整序列喂给 HF 看 logits 对不对
+            ref_ids = torch.tensor([generated], device=device)  # 所有已生成 token
+            print(f"generated so far: {tokenizer.decode(generated)!r}")
+            print(f"next_id from paged: {tokenizer.decode([next_id])!r}")
+
+
+        cache._seq_len += 1
+        next_id = logits[0, -1].argmax().item()
+        generated.append(next_id)
+        if next_id == tokenizer.eos_token_id:
+            break
+
+    return generated
 
 # 用 HuggingFace 作为 ground truth
 from transformers import AutoModelForCausalLM
@@ -138,83 +246,61 @@ prompts = [
     "1 + 1 =",
 ]
 MAX_NEW = 20
-
 for prompt in prompts:
     input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
-    
-    # HuggingFace greedy
     with torch.no_grad():
         hf_out = hf_model.generate(input_ids, max_new_tokens=MAX_NEW, do_sample=False)
     hf_text = tokenizer.decode(hf_out[0])
 
-    # Paged 版本逐步生成
     cache = make_paged_cache(max_seq_len=512)
-    generated = input_ids[0].tolist()
-
-    with torch.no_grad():
-        # prefill
-        logits = model(input_ids, kv_caches=[cache], is_prefill=True)
-        next_id = logits[0, -1].argmax().item()
-        generated.append(next_id)
-
-        # decode loop
-        for _ in range(MAX_NEW - 1):
-            dec_input = torch.tensor([[next_id]], device=device)
-            logits = model(dec_input, kv_caches=[cache], is_prefill=False)
-            next_id = logits[0, -1].argmax().item()
-            generated.append(next_id)
-            if next_id == tokenizer.eos_token_id:
-                break
-
+    generated = run_paged_generate(input_ids, cache, MAX_NEW)
     paged_text = tokenizer.decode(generated)
 
-    match = paged_text == hf_text
     print(f"\n  prompt: {prompt!r}")
     print(f"  HF:    {hf_text!r}")
     print(f"  Paged: {paged_text!r}")
-    print(f"  一致: {'✓' if match else '✗'}")
-
+    print(f"  一致: {'✓' if paged_text == hf_text else '✗'}")
     cache.reset()
     del cache
 
-print("\n" + "=" * 60)
-print("诊断：逐步对比 logits")
-print("=" * 60)
-prompt = "1 + 1 ="
-input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
-cache = make_paged_cache(max_seq_len=512)
+# print("\n" + "=" * 60)
+# print("诊断：逐步对比 logits")
+# print("=" * 60)
+# prompt = "1 + 1 ="
+# input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+# cache = make_paged_cache(max_seq_len=512)
 
-generated_ids = input_ids[0].tolist()
+# generated_ids = input_ids[0].tolist()
 
-with torch.no_grad():
-    # prefill
-    paged_logits = model(input_ids, kv_caches=[cache], is_prefill=True)
-    paged_tok = paged_logits[0, -1].argmax().item()
-    generated_ids.append(paged_tok)
+# with torch.no_grad():
+#     # prefill
+#     paged_logits = model(input_ids, kv_caches=[cache], is_prefill=True)
+#     paged_tok = paged_logits[0, -1].argmax().item()
+#     generated_ids.append(paged_tok)
 
-    for step in range(5):
-        # paged decode
-        p_in = torch.tensor([[paged_tok]], device=device)
-        cache.prepare_decode_step()
-        p_logits = model(p_in, kv_caches=[cache], is_prefill=False)[0, -1]
+#     for step in range(5):
+#         # paged decode
+#         p_in = torch.tensor([[paged_tok]], device=device)
+#         # cache.prepare_decode_step()
+#         p_logits = model(p_in, kv_caches=[cache], is_prefill=False)[0, -1]
 
-        # HF 用完整序列重算（公平对比）
-        full_ids = torch.tensor([generated_ids], device=device)
-        h_logits = hf_model(full_ids).logits[0, -1].float()
+#         # HF 用完整序列重算（公平对比）
+#         full_ids = torch.tensor([generated_ids], device=device)
+#         h_logits = hf_model(full_ids).logits[0, -1].float()
 
-        diff = (p_logits.float() - h_logits).abs()
-        p_tok = p_logits.argmax().item()
-        h_tok = h_logits.argmax().item()
+#         diff = (p_logits.float() - h_logits).abs()
+#         p_tok = p_logits.argmax().item()
+#         h_tok = h_logits.argmax().item()
 
-        print(f"Step {step+1}: 最大误差={diff.max():.4f} "
-              f"paged={tokenizer.decode([p_tok])!r} "
-              f"hf={tokenizer.decode([h_tok])!r} "
-              f"{'✓' if p_tok == h_tok else '✗'}")
+#         print(f"Step {step+1}: 最大误差={diff.max():.4f} "
+#               f"paged={tokenizer.decode([p_tok])!r} "
+#               f"hf={tokenizer.decode([h_tok])!r} "
+#               f"{'✓' if p_tok == h_tok else '✗'}")
 
-        paged_tok = p_tok
-        generated_ids.append(paged_tok)
+#         paged_tok = p_tok
+#         generated_ids.append(paged_tok)
 
-cache.reset()
+# cache.reset()
 # ============================================================
 # 测试五：batch decode（多请求）
 # ============================================================
@@ -229,26 +315,62 @@ prompts_batch = [
     "The capital of France is",
     "1 + 1 =",
 ]
-
-# 先对每个请求单独 prefill
+# prefill（逐个）
 caches = [make_paged_cache() for _ in prompts_batch]
 first_tokens = []
 
-with torch.no_grad():
-    for i, (prompt, cache) in enumerate(zip(prompts_batch, caches)):
-        ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
-        logits = model(ids, kv_caches=[cache], is_prefill=True)
-        tok = logits[0, -1].argmax().item()
-        first_tokens.append(tok)
+for prompt, cache in zip(prompts_batch, caches):
+    ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+    seq_len = ids.shape[1]
+    cache._allocate_for_prefill(seq_len)
+    slot_mapping = cache.get_prefill_slot_mapping(seq_len)
+    position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
+
+    with torch.no_grad():
+        logits = model(
+            ids,
+            kv_cache_k=bm.gpu_kv_cache[0],
+            kv_cache_v=bm.gpu_kv_cache[1],
+            position_ids=position_ids,
+            slot_mapping=slot_mapping,
+            is_prefill=True,
+        )
+    cache._seq_len += seq_len
+    first_tokens.append(logits[0, -1].argmax().item())
 
 print(f"  prefill 完成，first_tokens={[tokenizer.decode([t]) for t in first_tokens]}")
 
-# batch decode：2个请求同时 decode
+# batch decode
 B = len(caches)
-dec_input = torch.tensor([[t] for t in first_tokens], device=device)  # (2, 1)
+for c in caches:
+    c.prepare_decode_step()
+
+slots = [c.get_decode_slot() for c in caches]
+slot_mapping = torch.tensor(slots, dtype=torch.int32, device=device)
+position_ids = torch.tensor([[c.seq_len] for c in caches], dtype=torch.long, device=device)
+
+block_table = torch.full((B, cfg.MAX_BLOCKS_PER_SEQ), -1, dtype=torch.int32, device=device)
+for i, c in enumerate(caches):
+    bt = c.get_block_table()
+    block_table[i, :len(bt)] = bt
+
+context_lens = torch.tensor([c.seq_len + 1 for c in caches], dtype=torch.int32, device=device)
+dec_input = torch.tensor([[t] for t in first_tokens], dtype=torch.long, device=device)
 
 with torch.no_grad():
-    logits_batch = model(dec_input, kv_caches=caches, is_prefill=False)
+    logits_batch = model(
+        dec_input,
+        kv_cache_k=bm.gpu_kv_cache[0],
+        kv_cache_v=bm.gpu_kv_cache[1],
+        position_ids=position_ids,
+        slot_mapping=slot_mapping,
+        is_prefill=False,
+        block_table=block_table,
+        context_lens=context_lens,
+    )
+
+for c in caches:
+    c._seq_len += 1
 
 assert logits_batch.shape == (B, 1, cfg.vocab_size), f"batch decode 输出 shape 错误: {logits_batch.shape}"
 

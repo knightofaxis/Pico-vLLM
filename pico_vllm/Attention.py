@@ -103,17 +103,18 @@ def Decode_Paged_GQAAttention_Kernel(
     
     tl.store(out + pid_batch * (HEAD_DIM * N_HEAD) + pid_head * (HEAD_DIM) + tl.arange(0, HEAD_DIM), o_casted)
 
+@torch.compiler.disable
 def paged_decode_attention(q, k_cache, v_cache, block_table, context_lens,
                            MAX_BLOCKS_PER_SEQ, BLOCK_SIZE=16):
-    B, _, N_HEAD, HEAD_DIM = q.shape
+    B, N_HEAD, _, HEAD_DIM = q.shape
     N_KV_HEAD = k_cache.shape[1]
     scale = 1.0 / (HEAD_DIM ** 0.5)
 
     out = torch.empty(B, N_HEAD, 1, HEAD_DIM, device=q.device, dtype=q.dtype)
 
     # k_cache 的最大合法地址
-    max_physical_id = block_table.max().item()
-    max_offset = max_physical_id * N_KV_HEAD * BLOCK_SIZE * HEAD_DIM
+    # max_physical_id = block_table.max().item()
+    # max_offset = max_physical_id * N_KV_HEAD * BLOCK_SIZE * HEAD_DIM
     grid = (B, N_HEAD)
     Decode_Paged_GQAAttention_Kernel[grid](
         q, k_cache, v_cache, block_table, context_lens,
@@ -164,14 +165,14 @@ if __name__ == "__main__":
                              device=device, dtype=dtype)
         v_rand = torch.randn(SEQ_LEN, cfg.num_key_value_heads, cfg.head_dim,
                              device=device, dtype=dtype)
-        c.prefill_update(0, k_rand, v_rand)
+        c.prefill_update(torch.tensor(0), k_rand, v_rand)
         # decode 一步，写入新 token
         c.prepare_decode_step()
         k_new = torch.randn(1, cfg.num_key_value_heads, cfg.head_dim,
                             device=device, dtype=dtype)
         v_new = torch.randn(1, cfg.num_key_value_heads, cfg.head_dim,
                             device=device, dtype=dtype)
-        c.update(0, k_new.squeeze(0), v_new.squeeze(0))
+        c.update(torch.tensor(0), k_new.squeeze(0), v_new.squeeze(0))
         caches.append(c)
 
     # 构造 q
