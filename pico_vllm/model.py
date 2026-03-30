@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from cache import KVCache, NaiveKVCache, PagedKVCache
 from Attention import paged_decode_attention
 from store_kvcache import store_kvcache
+from RMSNorm import FastRMSNorm
+from SwiGLU import fused_swiglu
 
 @dataclass
 class ModelConfig:
@@ -40,6 +42,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     # @torch.compile(fullgraph=True)
+    # @torch.compile(options={"epilogue_fusion": True})
     def forward(self, x):
         # x: (B, seq, hidden_size)
         rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
@@ -151,7 +154,7 @@ class GQAAttention(nn.Module):
         q_triton = q.transpose(1, 2)
         
         out = paged_decode_attention(
-            q_triton, kv_cache_k, kv_cache_v,
+            q_triton, kv_cache_k, kv_cache_v,# type:ignore
             block_table, context_lens,
             MAX_BLOCKS_PER_SEQ=block_table.shape[1],
         )
@@ -187,7 +190,7 @@ class GQAAttention(nn.Module):
         v_flat = v.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
 
         # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
-        store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)
+        store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
 
         if is_prefill:
             output = self._prefill_attention(q, k, v)
@@ -196,6 +199,74 @@ class GQAAttention(nn.Module):
 
         return self.o_proj(output)
 
+    def forward_prefill(self,
+                x: Tensor,                    # (B, seq_len, hidden_size)
+                cos: Tensor, sin: Tensor, 
+                kv_cache_k: Tensor,
+                kv_cache_v: Tensor,
+                slot_mapping: Tensor,
+                block_table: Tensor | None = None,   # (B, max_blocks) int32，物理块id
+                context_lens: Tensor | None = None,  # (B,) int32，每个请求当前长度
+                ) -> Tensor:                  # (B, seq_len, hidden_size)
+        B, seq_len, _ = x.shape
+        qkv = self.qkv_proj(x)  # (B, seq, q_size + k_size + v_size)
+
+        q_size = self.cfg.num_attention_heads * self.cfg.head_dim
+        k_size = self.cfg.num_key_value_heads * self.cfg.head_dim
+
+        q, k, v = qkv.split([q_size, k_size, k_size], dim=-1)
+        q = q.view(B, seq_len, self.cfg.num_attention_heads, self.cfg.head_dim)
+        k = k.view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        v = v.view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        
+        # RoPE（两条路径共用）
+        q, k = RoPE.apply_rope(q, k, cos, sin)
+        # print(v.is_contiguous())
+        # k/v reshape 成 (total_tokens, n_kv_heads, head_dim) 给 store kernel
+        k_flat = k.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        v_flat = v.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
+
+        # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
+        store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
+
+        output = self._prefill_attention(q, k, v)
+
+        return self.o_proj(output)
+    
+    def forward_decode(self,
+                x: Tensor,                    # (B, seq_len, hidden_size)
+                cos: Tensor, sin: Tensor, 
+                kv_cache_k: Tensor,
+                kv_cache_v: Tensor,
+                slot_mapping: Tensor,
+                block_table: Tensor | None = None,   # (B, max_blocks) int32，物理块id
+                context_lens: Tensor | None = None,  # (B,) int32，每个请求当前长度
+                ) -> Tensor:                  # (B, seq_len, hidden_size)
+        B, seq_len, _ = x.shape
+        qkv = self.qkv_proj(x)  # (B, seq, q_size + k_size + v_size)
+
+        q_size = self.cfg.num_attention_heads * self.cfg.head_dim
+        k_size = self.cfg.num_key_value_heads * self.cfg.head_dim
+
+        q, k, v = qkv.split([q_size, k_size, k_size], dim=-1)
+        q = q.view(B, seq_len, self.cfg.num_attention_heads, self.cfg.head_dim)
+        k = k.view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        v = v.view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        
+        # RoPE（两条路径共用）
+        q, k = RoPE.apply_rope(q, k, cos, sin)
+        # print(v.is_contiguous())
+        # k/v reshape 成 (total_tokens, n_kv_heads, head_dim) 给 store kernel
+        k_flat = k.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        v_flat = v.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
+
+        # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
+        store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
+
+        output = self._decode_attention(q, kv_cache_k, kv_cache_v, block_table, context_lens)
+
+        return self.o_proj(output)
+    
 class SwiGLUFFN(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -214,7 +285,17 @@ class SwiGLUFFN(nn.Module):
         gate_up = self.gate_up_proj(x)
         gate, up = gate_up.split(self.cfg.intermediate_size, dim=-1)
         return self.down_proj(F.silu(gate) * up)  # (B, seq_len, hidden_size)
-
+    
+    def forward_decode(self, x):
+            # x: (B, 1, hidden_size)  -- 天然支持 B > 1
+            # 1. 跑一次大矩阵乘法 (GEMV/GEMM)，算出 gate_up
+            gate_up = self.gate_up_proj(x)
+            
+            # 2. 调用手写 Triton 算子，零碎片、零中间变量完成 SwiGLU
+            activated = fused_swiglu(gate_up)
+            
+            # 3. 再跑一次下采样矩阵乘法
+            return self.down_proj(activated)
 
 #############################################################
 # Transformer block
@@ -226,8 +307,8 @@ class TransformerBlock(nn.Module):
         self.layer_idx = layer_idx
         self.attn = GQAAttention(cfg, layer_idx=layer_idx)
         self.ffn = SwiGLUFFN(cfg)
-        self.norm1 = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.norm2 = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.norm1 = FastRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.norm2 = FastRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
     def forward(self, x, cos, sin,
                 kv_cache_k: Tensor,   # 当前层的 slice: (num_blocks, n_kv_heads, block_size, head_dim)
@@ -250,6 +331,24 @@ class TransformerBlock(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x
 
+    def forward_decode(self, x, cos, sin,
+                kv_cache_k: Tensor,   # 当前层的 slice: (num_blocks, n_kv_heads, block_size, head_dim)
+                kv_cache_v: Tensor,
+                slot_mapping: Tensor,
+                block_table: Tensor | None = None,
+                context_lens: Tensor | None = None,
+                ):
+        attn_out = self.attn.forward_decode(
+            self.norm1(x), cos, sin,
+            kv_cache_k=kv_cache_k,
+            kv_cache_v=kv_cache_v,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
+            context_lens=context_lens,
+        )
+        x = x + attn_out
+        x = x + self.ffn.forward_decode(self.norm2(x))
+        return x
 #############################################################
 # Model Assembly to Qwen2.5-1.5B
 #############################################################
@@ -260,7 +359,7 @@ class Qwen25_15B(nn.Module):
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.rope = RoPE(cfg.head_dim, cfg.rope_theta)
         self.layers = nn.ModuleList([TransformerBlock(cfg, layer_idx=i) for i in range(cfg.num_hidden_layers)])
-        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.norm = FastRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         if not cfg.tie_word_embeddings:
             self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         else:
@@ -295,3 +394,29 @@ class Qwen25_15B(nn.Module):
         x = self.norm(x)
         return F.linear(x, self.embed_tokens.weight)
 
+    def forward_decode(self,
+            input_ids: Tensor,
+            kv_cache_k: Tensor,       # (num_layers, num_blocks, n_kv_heads, block_size, head_dim)
+            kv_cache_v: Tensor,
+            position_ids: Tensor,     # prefill: (1, seq_len)  decode: (B, 1)
+            slot_mapping: Tensor,     # (total_tokens,) int32
+            block_table: Tensor | None = None,   # decode: (B, MAX_BLOCKS)
+            context_lens: Tensor | None = None,  # decode: (B,)
+            ) -> Tensor:
+        
+        x = self.embed_tokens(input_ids)
+
+        # position_ids 直接用传入的，不再从 kv_caches 计算
+        cos, sin = self.rope.get_cos_sin(position_ids)
+
+        for layer_idx, layer in enumerate(self.layers):
+            x = layer.forward_decode(# type:ignore
+                x, cos, sin,
+                kv_cache_k=kv_cache_k[layer_idx],  # 每层取自己的 slice
+                kv_cache_v=kv_cache_v[layer_idx],
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                context_lens=context_lens,
+            )
+        x = self.norm(x)
+        return F.linear(x, self.embed_tokens.weight)
