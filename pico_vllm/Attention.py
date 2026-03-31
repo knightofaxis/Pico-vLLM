@@ -39,6 +39,10 @@ def Decode_Paged_GQAAttention_Kernel(
     q_vec = tl.reshape(tl.load(q_ptrs), (HEAD_DIM, 1))
 
     context_len = tl.load(context_lens + pid_batch)
+    if context_len == 0:
+        # 写零输出，直接返回
+        # tl.store(out + pid_batch * (HEAD_DIM * N_HEAD) + pid_head * (HEAD_DIM) + tl.arange(0, HEAD_DIM), tl.zeros((HEAD_DIM,), dtype=tl.float32))
+        return
     max_block_index = tl.cdiv(context_len, BLOCK_SIZE)  # 向上取整
     offs_kv = tl.arange(0, BLOCK_SIZE * HEAD_DIM)
     

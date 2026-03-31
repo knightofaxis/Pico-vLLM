@@ -9,6 +9,7 @@ from Attention import paged_decode_attention
 from store_kvcache import store_kvcache
 from RMSNorm import FastRMSNorm
 from SwiGLU import fused_swiglu
+from Fused_RoPE_KVcache_store import fused_decode_rope_and_cache
 
 @dataclass
 class ModelConfig:
@@ -239,8 +240,8 @@ class GQAAttention(nn.Module):
                 kv_cache_k: Tensor,
                 kv_cache_v: Tensor,
                 slot_mapping: Tensor,
-                block_table: Tensor | None = None,   # (B, max_blocks) int32，物理块id
-                context_lens: Tensor | None = None,  # (B,) int32，每个请求当前长度
+                block_table: Tensor,   # (B, max_blocks) int32，物理块id
+                context_lens: Tensor,  # (B,) int32，每个请求当前长度
                 ) -> Tensor:                  # (B, seq_len, hidden_size)
         B, seq_len, _ = x.shape
         qkv = self.qkv_proj(x)  # (B, seq, q_size + k_size + v_size)
@@ -254,16 +255,22 @@ class GQAAttention(nn.Module):
         v = v.view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
         
         # RoPE（两条路径共用）
-        q, k = RoPE.apply_rope(q, k, cos, sin)
-        # print(v.is_contiguous())
-        # k/v reshape 成 (total_tokens, n_kv_heads, head_dim) 给 store kernel
-        k_flat = k.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
-        v_flat = v.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        # q, k = RoPE.apply_rope(q, k, cos, sin)
+        # # print(v.is_contiguous())
+        # # k/v reshape 成 (total_tokens, n_kv_heads, head_dim) 给 store kernel
+        # k_flat = k.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        # v_flat = v.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
 
-        # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
-        store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
+        # # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
+        # store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
+        q_rot = fused_decode_rope_and_cache(
+            q, k, v, cos, sin, 
+            kv_cache_k, kv_cache_v, 
+            slot_mapping,
+            context_lens
+        )
 
-        output = self._decode_attention(q, kv_cache_k, kv_cache_v, block_table, context_lens)
+        output = self._decode_attention(q_rot, kv_cache_k, kv_cache_v, block_table, context_lens)
 
         return self.o_proj(output)
     
@@ -335,8 +342,8 @@ class TransformerBlock(nn.Module):
                 kv_cache_k: Tensor,   # 当前层的 slice: (num_blocks, n_kv_heads, block_size, head_dim)
                 kv_cache_v: Tensor,
                 slot_mapping: Tensor,
-                block_table: Tensor | None = None,
-                context_lens: Tensor | None = None,
+                block_table: Tensor,
+                context_lens: Tensor,
                 ):
         attn_out = self.attn.forward_decode(
             self.norm1(x), cos, sin,
@@ -400,8 +407,8 @@ class Qwen25_15B(nn.Module):
             kv_cache_v: Tensor,
             position_ids: Tensor,     # prefill: (1, seq_len)  decode: (B, 1)
             slot_mapping: Tensor,     # (total_tokens,) int32
-            block_table: Tensor | None = None,   # decode: (B, MAX_BLOCKS)
-            context_lens: Tensor | None = None,  # decode: (B,)
+            block_table: Tensor,   # decode: (B, MAX_BLOCKS)
+            context_lens: Tensor,  # decode: (B,)
             ) -> Tensor:
         
         x = self.embed_tokens(input_ids)

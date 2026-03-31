@@ -56,15 +56,7 @@ class Engine:
             dtype=torch.int32, device=self.device
         )
         self.static_context_lens = torch.zeros(self.max_batch_size, dtype=torch.int32, device=self.device)
-
-        # self.static_input_ids.fill_(1)
-        # self.static_position_ids.fill_(1)
-        # # 故意填一个大一点的 context_len，逼迫 Triton 编译出能扛长序列的强壮 Kernel
-        # self.static_context_lens.fill_(1) 
-        # self.static_slot_mapping.fill_(0)
-        # # 假装大家都分配了第 0 个物理块（反正只是预热，读里面的 0 没关系）
-        # self.static_block_table.fill_(0)
-
+        
         # 预热（触发 Triton autotune）
         for _ in range(3):
             with torch.no_grad():
@@ -94,106 +86,31 @@ class Engine:
         
         print(f"CUDA Graph captured (batch_size={self.max_batch_size})")
     
-    def _decode_step_graph(self, decoding, kv_caches) -> torch.Tensor:
-        """CUDA Graph replay 路径"""
+    def _decode_step_graph(self, decoding: list) -> torch.Tensor:
+        """用 CUDA Graph replay 做 batch decode"""
         B = len(decoding)
-
-        # =================================================================
-        # 1. CPU侧
-        # =================================================================
-        input_ids_cpu = []
-        slot_mapping_cpu = []
-        position_ids_cpu = []
-        context_lens_cpu = []
-
-        for request, c in zip(decoding, kv_caches):
-            c.prepare_decode_step()
-            input_ids_cpu.append([request.generated_ids[-1]])
-            slot_mapping_cpu.append(c.get_decode_slot())
-            position_ids_cpu.append([c._seq_len])
-            context_lens_cpu.append(c._seq_len + 1)
-
-        # 补齐 Padding (幽灵请求)
-        if B < self.max_batch_size:
-            pad_len = self.max_batch_size - B
-            input_ids_cpu.extend([[0]] * pad_len)
-            slot_mapping_cpu.extend([-1] * pad_len)
-            position_ids_cpu.extend([[0]] * pad_len)
-            context_lens_cpu.extend([0] * pad_len)
-
-        # =================================================================
-        # 2. DMA 异步拷贝
-        # =================================================================
-        self.static_input_ids.copy_(torch.tensor(input_ids_cpu, dtype=torch.long), non_blocking=True)
-        self.static_slot_mapping.copy_(torch.tensor(slot_mapping_cpu, dtype=torch.int32), non_blocking=True)
-        self.static_position_ids.copy_(torch.tensor(position_ids_cpu, dtype=torch.long), non_blocking=True)
-        self.static_context_lens.copy_(torch.tensor(context_lens_cpu, dtype=torch.int32), non_blocking=True)
-
-        # =================================================================
-        # 3. Block Table
-        # =================================================================
-        self.static_block_table.fill_(-1)
-
-        for i, c in enumerate(kv_caches):
-            bt = c.get_block_table()
-            self.static_block_table[i, :bt.shape[0]].copy_(bt, non_blocking=True)
-
-        # =================================================================
-        # 4. CUDA Graph重放
-        # =================================================================
+        
+        for i, request in enumerate(decoding):
+            request.kv_cache.prepare_decode_step()
+            self.static_input_ids[i, 0]   = request.generated_ids[-1]
+            self.static_slot_mapping[i]   = request.kv_cache.get_decode_slot()
+            self.static_position_ids[i, 0]= request.kv_cache._seq_len
+            bt = request.kv_cache.get_block_table()
+            self.static_block_table[i, :len(bt)].copy_(bt, non_blocking=True)
+            self.static_context_lens[i]   = request.kv_cache._seq_len + 1
+        
+        # padding slots（B < max_batch_size 时）
+        # context_lens=0 让 kernel 跳过这些 slot
+        self.static_context_lens[B:].fill_(0)
+        
         self.cuda_graph.replay()
-
-        for c in kv_caches:
-            c._seq_len += 1
-
+        
+        # 手动更新 seq_len
+        for request in decoding:
+            request.kv_cache._seq_len += 1
+        
         return self.static_output[:B, -1, :]  # (B, vocab_size)
     
-    def _decode_step_eager(self, decoding, kv_caches, B) -> torch.Tensor:
-        """普通 eager 路径，用于 B > max_batch_size 或 use_cuda_graph=False"""
-        for c in kv_caches:
-            c.prepare_decode_step()
-
-        slots = [c.get_decode_slot() for c in kv_caches]
-        slot_mapping = torch.tensor(slots, dtype=torch.int32, device=self.device)
-
-        input_ids = torch.tensor(
-            [[r.generated_ids[-1]] for r in decoding],
-            dtype=torch.long, device=self.device
-        )
-        position_ids = torch.tensor(
-            [[c.seq_len] for c in kv_caches],
-            dtype=torch.long, device=self.device
-        )
-        block_table = torch.full(
-            (B, self.model.cfg.MAX_BLOCKS_PER_SEQ), -1,
-            dtype=torch.int32, device=self.device
-        )
-        for i, c in enumerate(kv_caches):
-            bt = c.get_block_table()
-            block_table[i, :len(bt)] = bt
-
-        context_lens = torch.tensor(
-            [c.seq_len + 1 for c in kv_caches],
-            dtype=torch.int32, device=self.device
-        )
-
-        with torch.no_grad():
-            logits = self.model(
-                input_ids,
-                kv_cache_k=self.block_manager.gpu_kv_cache[0],
-                kv_cache_v=self.block_manager.gpu_kv_cache[1],
-                position_ids=position_ids,
-                slot_mapping=slot_mapping,
-                is_prefill=False,
-                block_table=block_table,
-                context_lens=context_lens,
-            )
-
-        for c in kv_caches:
-            c._seq_len += 1
-
-        return logits[:, -1, :]  # (B, vocab_size)
-
     ###########################################
     # Batch 版本的接口，包括submit(),step()
     ###########################################
@@ -203,44 +120,53 @@ class Engine:
             max_new_tokens: int, 
             temperature: float, 
             top_p: float) -> int:
-            """提交生成请求，返回 request_id"""
-            # 转成 list 存储
-            input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device).tolist()[0]
-            request = self.scheduler.create_request(input_ids, max_new_tokens, temperature, top_p, self.kv_cache_cls, self.kv_cache_kwargs)
-            self.scheduler.add_request(request)
-            return request.request_id
+        """提交生成请求，返回 request_id"""
+        # 转成 list 存储
+        input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device).tolist()[0]
+        request = self.scheduler.create_request(input_ids, max_new_tokens, temperature, top_p, self.kv_cache_cls, self.kv_cache_kwargs)
+        self.scheduler.add_request(request)
+        return request.request_id
     
     def step(self) -> list[tuple[int, str]]:
+        """调度器主循环，处理所有请求的 prefill 和 decode
+        return: list of (request_id, generated_text)，包含刚刚完成的请求的id和生成结果"""
         prefilling, decoding = self.scheduler.schedule()
+        # 这里的 prefilling 和 decoding 是 Request 对象列表，包含了每个请求的状态和参数
+        # 需要对它们进行分组，构造成适合模型输入的 batch，然后调用模型进行前向计算，最后将结果写回对应的 Request 对象中
+        # 在实现paged KV cache之前，先实现一个简单的版本，直接对每个请求调用 prefill() 和 decode_step()，不进行真正的 batch 处理
+        # prefill 按照单个请求处理，decode 按多个请求一起处理
+        
         completed_requests = []
-
-        # ── prefill：逐个请求，动态形状，不走 graph ──
+        # prefill：逐个请求，slot_mapping 长度各不同
         for request in prefilling:
             input_ids = torch.tensor(request.input_ids).unsqueeze(0).to(self.device)
             kv_cache = request.kv_cache
             kv_cache._allocate_for_prefill(len(request.input_ids))
             slot_mapping = kv_cache.get_prefill_slot_mapping(len(request.input_ids))
 
-            start_pos = kv_cache.seq_len
+            # 新增：构造 position_ids
+            start_pos = kv_cache.seq_len  # prefill 前是 0
             position_ids = torch.arange(
                 start_pos, start_pos + len(request.input_ids),
                 dtype=torch.long, device=self.device
-            ).unsqueeze(0)
+            ).unsqueeze(0)  # (1, seq_len)
 
             with torch.no_grad():
                 logits = self.model(
                     input_ids,
-                    kv_cache_k=self.block_manager.gpu_kv_cache[0],
+                    kv_cache_k=self.block_manager.gpu_kv_cache[0],  # 传 tensor
                     kv_cache_v=self.block_manager.gpu_kv_cache[1],
                     position_ids=position_ids,
                     slot_mapping=slot_mapping,
                     is_prefill=True,
                 )
 
-            kv_cache._seq_len += len(request.input_ids)  # 不加 1
-
+            # 新增：forward 之后手动更新 seq_len（原来在 prefill_update 里做）
+            kv_cache._seq_len += len(request.input_ids) + 1
+            
             next_token_id = sampler.sample(logits[:, -1, :], request.temperature, request.top_p)
             request.generated_ids.append(int(next_token_id.item()))
+            request.kv_cache = kv_cache
 
             if next_token_id.item() == self.eos_token_id or request.is_max_len_finished():
                 request.has_finished_notification = True
@@ -249,18 +175,59 @@ class Engine:
                     self.tokenizer.decode(request.input_ids + request.generated_ids)
                 ))
 
-        # ── decode：batch，走 CUDA Graph 或 eager ──
+        # decode：batch，slot_mapping shape = (B,)
         if decoding:
             B = len(decoding)
             kv_caches = [r.kv_cache for r in decoding]
 
-            if self.use_cuda_graph and B <= self.max_batch_size:
-                logits_batch = self._decode_step_graph(decoding, kv_caches)
-            else:
-                logits_batch = self._decode_step_eager(decoding, kv_caches, B)
+            for request in decoding:
+                request.kv_cache.prepare_decode_step()
 
+            slots = [c.get_decode_slot() for c in kv_caches]
+            slot_mapping = torch.tensor(slots, dtype=torch.int32, device=self.device)
+
+            input_ids = torch.tensor(
+                [[r.generated_ids[-1]] for r in decoding],
+                dtype=torch.long, device=self.device
+            )
+
+            # 新增：position_ids，每个请求当前的位置
+            position_ids = torch.tensor(
+                [[c.seq_len] for c in kv_caches],
+                dtype=torch.long, device=self.device
+            )  # (B, 1)
+
+            block_table = torch.full(
+                (B, self.model.cfg.MAX_BLOCKS_PER_SEQ), -1,
+                dtype=torch.int32, device=self.device
+            )
+            for i, c in enumerate(kv_caches):
+                bt = c.get_block_table()
+                block_table[i, :len(bt)] = bt
+
+            context_lens = torch.tensor(
+                [c.seq_len + 1 for c in kv_caches],
+                dtype=torch.int32, device=self.device
+            )
+
+            with torch.no_grad():
+                logits = self.model(
+                    input_ids,
+                    kv_cache_k=self.block_manager.gpu_kv_cache[0],  # 传 tensor
+                    kv_cache_v=self.block_manager.gpu_kv_cache[1],
+                    position_ids=position_ids,
+                    slot_mapping=slot_mapping,
+                    is_prefill=False,
+                    block_table=block_table,
+                    context_lens=context_lens,
+                )
+
+            # 新增：forward 之后手动更新 seq_len
+            for c in kv_caches:
+                c._seq_len += 1
+            
             for i, request in enumerate(decoding):
-                next_token_id = sampler.sample(logits_batch[i], request.temperature, request.top_p)
+                next_token_id = sampler.sample(logits[i, -1, :], request.temperature, request.top_p)
                 request.generated_ids.append(int(next_token_id.item()))
                 if next_token_id.item() == self.eos_token_id or request.is_max_len_finished():
                     request.has_finished_notification = True
