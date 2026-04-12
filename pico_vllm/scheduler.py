@@ -31,10 +31,10 @@ class Request:
     request_status: RequestStatus
     has_eos_token: bool  # 是否已经生成 eos_token，scheduler 不直接接触 tokenizer 和 eos_token_id，这个由 engine 在 decode_step 后更新
 
-    def __init__(self, request_id: int, input_ids: List[int], max_new_tokens: int, temperature: float, top_p: float, kv_cache: PagedKVCache):
+    def __init__(self, request_id: int, input_ids: List[int], max_new_tokens: int, temperature: float, top_p: float, kv_cache: PagedKVCache, generated_ids: List[int] | None = None):
         self.request_id = request_id
         self.input_ids = input_ids
-        self.generated_ids = []  # 初始为 空
+        self.generated_ids = generated_ids if generated_ids is not None else []
         self.request_status = RequestStatus.WAITING
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
@@ -58,6 +58,7 @@ class Scheduler:
     max_num_seqs: int  # 同时处理的最大请求数，超过这个数的新请求会排队等待
     kv_cache_cls : type[PagedKVCache]  # KVCache 的类，用于创建请求的 KV cache 实例
     kv_cache_kwargs = {}  # 创建 KV cache 实例的参数字典
+    no_more_requests = False  # 不会再有新请求加入
 
     waiting: List[Request]    # 还没开始处理的请求
     prefilling: List[Request]   # 正在 prefill 的请求
@@ -73,6 +74,13 @@ class Scheduler:
         self.decoding = []
         self.finished = []
 
+    def is_all_done(self) -> bool:
+        """所有请求都处理完了，且不会再有新的"""
+        return (self.no_more_requests 
+                and len(self.waiting) == 0 
+                and len(self.prefilling) == 0 
+                and len(self.decoding) == 0)
+    
     ''' 插入新请求
     - input_ids: 输入的 token ids，shape (1, seq_len)，包含整个 prompt
     - max_new_tokens: 最多生成多少个 token
@@ -113,8 +121,11 @@ class Scheduler:
     '''' 添加新请求到等待队列
     - request: 新的请求对象
     '''
-    def add_request(self, request: Request):
-        self.waiting.append(request)
+    def add_request(self, request: Request, type:RequestStatus=RequestStatus.WAITING):
+        if type == RequestStatus.WAITING:
+            self.waiting.append(request)
+        elif type == RequestStatus.DECODING:
+            self.decoding.append(request)
 
     ''' 调度器主循环
     return: 2个列表，分别是当前处于 prefilling、decoding 状态的请求列表
@@ -173,102 +184,3 @@ class Scheduler:
     @property
     def num_finished(self) -> int:
         return len(self.finished)
-
-
-# if __name__ == "__main__":
-#     from scheduler import Scheduler, Request, RequestStatus
-#     from cache import NaiveKVCache
-    
-#     # KV cache 配置，所有请求共用
-#     kv_cache_kwargs = dict(
-#         num_layers=4,       # 用小值，不需要真实模型
-#         max_seq_len=256,
-#         num_kv_heads=2,
-#         head_dim=64,
-#         device='cpu',
-#         dtype=torch.float32,
-#     )
-    
-#     scheduler = Scheduler(
-#         kv_cache_cls=NaiveKVCache,
-#         kv_cache_kwargs=kv_cache_kwargs,
-#         max_num_seqs=3,
-#     )
-    
-#     # 插入 5 个请求，超过 max_num_seqs
-#     for i in range(5):
-#         scheduler.insert_request(
-#             input_ids=list(range(i + 3)),  # 不同长度的 prompt
-#             max_new_tokens=10,
-#             temperature=0.0,
-#             top_p=1.0,
-#         )
-    
-#     print(f"初始状态: waiting={scheduler.num_waiting}, "
-#           f"prefilling={scheduler.num_prefilling}, "
-#           f"decoding={scheduler.num_decoding}")
-#     assert scheduler.num_waiting == 5
-    
-#     # Step 1：前 3 个进入 prefilling
-#     prefilling, decoding = scheduler.schedule()
-#     print(f"\nStep 1 schedule 后:")
-#     print(f"  waiting={scheduler.num_waiting}, "
-#           f"prefilling={scheduler.num_prefilling}, "
-#           f"decoding={scheduler.num_decoding}")
-#     print(f"  prefilling ids: {[r.request_id for r in prefilling]}")
-#     print(f"  decoding ids:   {[r.request_id for r in decoding]}")
-#     assert scheduler.num_waiting == 2
-#     assert scheduler.num_prefilling == 3
-#     assert scheduler.num_decoding == 0
-    
-#     # 验证 KV cache 已创建
-#     for r in prefilling:
-#         assert r.kv_cache is not None, f"request {r.request_id} 没有 kv_cache"
-#         assert r.request_status == RequestStatus.PREFILL
-#     print("  KV cache 创建正确 ✓")
-    
-#     # 模拟 engine 完成 prefill：更新 generated_ids
-#     for r in prefilling:
-#         r.generated_ids.append(100)  # 假装生成了一个 token
-    
-#     # Step 2：prefilling → decoding，waiting 里补充一个进来
-#     prefilling, decoding = scheduler.schedule()
-#     print(f"\nStep 2 schedule 后:")
-#     print(f"  waiting={scheduler.num_waiting}, "
-#           f"prefilling={scheduler.num_prefilling}, "
-#           f"decoding={scheduler.num_decoding}")
-#     print(f"  prefilling ids: {[r.request_id for r in prefilling]}")
-#     print(f"  decoding ids:   {[r.request_id for r in decoding]}")
-#     assert scheduler.num_waiting == 2   # 还剩 1 个等待
-#     assert scheduler.num_prefilling == 0  # 新进来 1 个
-#     assert scheduler.num_decoding == 3    # 上一步的 3 个
-    
-#     # Step 3：模拟其中一个请求遇到 EOS
-#     decoding[0].has_eos_token = True
-    
-#     # 模拟 engine 完成 decode
-#     for r in decoding:
-#         r.generated_ids.append(101)
-    
-#     prefilling, decoding = scheduler.schedule()
-#     print(f"\nStep 3 schedule 后（一个请求 EOS）:")
-#     print(f"  waiting={scheduler.num_waiting}, "
-#           f"prefilling={scheduler.num_prefilling}, "
-#           f"decoding={scheduler.num_decoding}, "
-#           f"finished={scheduler.num_finished}")
-#     assert scheduler.num_finished == 1
-#     assert scheduler.num_decoding == 2   # EOS 的那个移出了
-#     print(f"  finished ids: {[r.request_id for r in scheduler.finished]}")
-    
-#     # Step 4：模拟一个请求达到 max_new_tokens
-#     for r in decoding:
-#         r.generated_ids = list(range(10))  # 填满 max_new_tokens=10
-    
-#     prefilling, decoding = scheduler.schedule()
-#     print(f"\nStep 4 schedule 后（max_new_tokens 耗尽）:")
-#     print(f"  waiting={scheduler.num_waiting}, "
-#           f"prefilling={scheduler.num_prefilling}, "
-#           f"decoding={scheduler.num_decoding}, "
-#           f"finished={scheduler.num_finished}")
-    
-#     print("\n所有断言通过 ✓")

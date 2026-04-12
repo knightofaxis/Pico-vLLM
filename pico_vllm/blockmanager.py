@@ -17,6 +17,7 @@ class BlockManager:
                  num_kv_heads: int, 
                  head_dim: int, 
                  dtype: dtype):
+        self.dtype = dtype
         ########## 物理块索引 ##########
         self.num_physical_gpu_blocks = num_gpu_blocks
         self.num_physical_cpu_blocks = num_cpu_blocks

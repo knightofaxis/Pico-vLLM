@@ -3,9 +3,9 @@ import transformers
 from cache import KVCache, NaiveKVCache, PagedKVCache, BlockManager
 import sampler
 from scheduler import RequestStatus, Scheduler, Request
+from kv_transfer import KVTransferBase, SyncKVTransfer, NoOpKVTransfer
 
 ''' Engine 负责管理模型和采样器，提供统一接口供外部调用
-- 第一阶段的计划是支持单卡、单模型、单batch，无KV cache，单步采样
 '''
 class Engine:
     def __init__(self, 
@@ -14,10 +14,11 @@ class Engine:
                  block_manager: BlockManager, 
                  cache_cls : type[PagedKVCache], 
                  cache_kwargs: dict|None = None, device='cuda',
-                 use_cuda_graph=True,   # ← 新增开关
+                 use_cuda_graph=True,   # 是否启用 CUDA Graph，启用后要求 batch size 固定为 max_batch_size
                  max_batch_size=8,      # ← CUDA Graph 需要固定 batch size,
                  tp_size=1, 
                  rank=0,
+                 role:str="pd",
                  manual_seed=42
                  ):
         self.model = model.to(device)
@@ -27,7 +28,7 @@ class Engine:
         self.kv_cache_cls = cache_cls
         # KV cache 的配置参数，后续可以改成动态的
         self.kv_cache_kwargs = cache_kwargs if cache_kwargs is not None else dict(
-            block_manager=block_manager,   # ← 加这个
+            block_manager=block_manager,
             num_layers=model.cfg.num_hidden_layers,
             max_seq_len=4096,
             num_kv_heads=model.cfg.local_num_key_value_heads,
@@ -38,18 +39,34 @@ class Engine:
         self.block_manager = block_manager
         self.eos_token_id = tokenizer.eos_token_id
 
+        ### tp 并行相关设置 ###
         self.tp_size = tp_size
         self.rank = rank
         if tp_size > 1:
             torch.manual_seed(manual_seed)
             torch.cuda.manual_seed(manual_seed)
+        
+        ### PD 分离相关设置 ###
+        self.role = role
+        if self.role == "p":
+            self.transfer = SyncKVTransfer(local_rank=rank, peer_rank=1, device=device,
+                                            block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,)
+        elif self.role == "d":
+            self.transfer = SyncKVTransfer(local_rank=rank, peer_rank=0, device=device,
+                                            block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,)
+        else:
+            # self.transfer = None  # role="pd" 不需要传输层
+            self.transfer = NoOpKVTransfer()  # 类型安全，poll() 和 try_recv 都是 no-op
 
         self.scheduler = Scheduler(kv_cache_cls=cache_cls, kv_cache_kwargs=self.kv_cache_kwargs)
+        self.no_more_requests = False # 不会再有更多请求进入
+        self._done_sent = False # 已经全部发送完
 
         self.use_cuda_graph = use_cuda_graph
         self.max_batch_size = max_batch_size
         
-        if use_cuda_graph:
+        # CUDA Graph 只在有 decode 职责时 build
+        if use_cuda_graph and role in ("d", "pd"):
             self._build_cuda_graph()
 
         self.model.eval()
@@ -196,7 +213,7 @@ class Engine:
         return logits[:, -1, :]  # (B, vocab_size)
 
     ###########################################
-    # Batch 版本的接口，包括submit(),step()
+    # Batch 版本的接口，包括submit(),step(),is_done()
     ###########################################
 
     def submit(self, 
@@ -205,13 +222,27 @@ class Engine:
             temperature: float, 
             top_p: float) -> int:
             """提交生成请求，返回 request_id"""
+            # 如果已经完成，返回-1
+            if self.no_more_requests:
+                return -1
             # 转成 list 存储
             input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device).tolist()[0]
             request = self.scheduler.create_request(input_ids, max_new_tokens, temperature, top_p, self.kv_cache_cls, self.kv_cache_kwargs)
             self.scheduler.add_request(request)
             return request.request_id
     
+    def mark_finished(self):
+        """告诉 Engine 不会再有新请求提交"""
+        self.no_more_requests = True
+    
     def step(self) -> list[tuple[int, str]]:
+        # ── D 侧：先检查有没有新到的请求，在 schedule 之前 ──
+        if self.role == "d" and not self.transfer.recv_done:
+            new_request = self.transfer.try_recv_request()
+            if new_request:
+                # print(f'[Rank 1] new request received id {new_request.request_id}')
+                self.scheduler.add_request(new_request, RequestStatus.DECODING)
+
         prefilling, decoding = self.scheduler.schedule()
         completed_requests = []
 
@@ -238,23 +269,51 @@ class Engine:
                     is_prefill=True,
                 )
 
-            kv_cache._seq_len += len(request.input_ids)  # 不加 1
+            kv_cache._seq_len += len(request.input_ids)
 
+            # debug：打印每个请求分配到的物理 block
+            # print(f"[DEBUG] req {request.request_id}: "
+            #     f"seq_len={kv_cache.seq_len}, "
+            #     f"blocks={kv_cache.get_block_table().tolist()}, "
+            #     f"allocated={kv_cache.allocated_cache_block_num}")
             next_token_id = sampler.sample(logits[:, -1, :], request.temperature, request.top_p)
             request.generated_ids.append(int(next_token_id.item()))
+            # print(next_token_id.item())
 
-            if next_token_id.item() == self.eos_token_id or request.is_max_len_finished():
+            if self.role == "p":
+                self.transfer.send_request(request)
+                # print(f'[Rank 0] sent request id {request.request_id}')
+                request.kv_cache.reset()
+                request.has_finished_notification = True
+            elif next_token_id.item() == self.eos_token_id or request.is_max_len_finished():
                 request.has_finished_notification = True
                 completed_requests.append((
                     request.request_id,
                     self.tokenizer.decode(request.input_ids + request.generated_ids)
                 ))
 
+        # ── P 侧：所有 prefill 做完且用户标记 no_more_requests，发终止信号 ──
+        if (self.role == "p"
+            and self.no_more_requests
+            and len(self.scheduler.waiting) == 0
+            and len(self.scheduler.prefilling) == 0
+            and not self._done_sent):
+            self.transfer.send_done()
+            self._done_sent = True
+            # print("[Rank 0] sent done flag set")
+
         # ── decode：batch，走 CUDA Graph 或 eager ──
-        if decoding:
+        if decoding and self.role in ("d", "pd"):
             B = len(decoding)
+            # print(B)
             kv_caches = [r.kv_cache for r in decoding]
 
+            # # debug：打印 decode 时每个请求的 block table
+            # for i, (r, c) in enumerate(zip(decoding, kv_caches)):
+            #     print(f"[DEBUG decode] req {r.request_id}: "
+            #         f"seq_len={c.seq_len}, "
+            #         f"blocks={c.get_block_table().tolist()}")
+                
             if self.use_cuda_graph and B <= self.max_batch_size:
                 logits_batch = self._decode_step_graph(decoding, kv_caches)
             else:
@@ -271,3 +330,15 @@ class Engine:
                     ))
 
         return completed_requests
+    
+    def is_done(self) -> bool:
+        if self.role == "p":
+            return self._done_sent
+        elif self.role == "d":
+            return (self.transfer.recv_done
+                    and len(self.scheduler.decoding) == 0)
+        else:  # "pd"
+            return (self.no_more_requests
+                    and len(self.scheduler.waiting) == 0
+                    and len(self.scheduler.prefilling) == 0
+                    and len(self.scheduler.decoding) == 0)
