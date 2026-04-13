@@ -3,7 +3,7 @@ import transformers
 from cache import KVCache, NaiveKVCache, PagedKVCache, BlockManager
 import sampler
 from scheduler import RequestStatus, Scheduler, Request
-from kv_transfer import KVTransferBase, SyncKVTransfer, NoOpKVTransfer
+from kv_transfer import KVTransferBase, SyncKVTransfer, NoOpKVTransfer, AsyncKVTransfer
 
 ''' Engine 负责管理模型和采样器，提供统一接口供外部调用
 '''
@@ -49,11 +49,11 @@ class Engine:
         ### PD 分离相关设置 ###
         self.role = role
         if self.role == "p":
-            self.transfer = SyncKVTransfer(local_rank=rank, peer_rank=1, device=device,
-                                            block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,)
+            self.transfer = AsyncKVTransfer(local_rank=rank, peer_rank=1, device=device,
+                                            block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,role=role,)
         elif self.role == "d":
-            self.transfer = SyncKVTransfer(local_rank=rank, peer_rank=0, device=device,
-                                            block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,)
+            self.transfer = AsyncKVTransfer(local_rank=rank, peer_rank=0, device=device,
+                                            block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,role=role,)
         else:
             # self.transfer = None  # role="pd" 不需要传输层
             self.transfer = NoOpKVTransfer()  # 类型安全，poll() 和 try_recv 都是 no-op
@@ -236,11 +236,14 @@ class Engine:
         self.no_more_requests = True
     
     def step(self) -> list[tuple[int, str]]:
+        self.transfer.poll()  # NoOpKVTransfer 里是 no-op，不影响 role="pd"
+
         # ── D 侧：先检查有没有新到的请求，在 schedule 之前 ──
         if self.role == "d" and not self.transfer.recv_done:
-            new_request = self.transfer.try_recv_request()
-            if new_request:
-                # print(f'[Rank 1] new request received id {new_request.request_id}')
+            while True:
+                new_request = self.transfer.try_recv_request()
+                if new_request is None:
+                    break
                 self.scheduler.add_request(new_request, RequestStatus.DECODING)
 
         prefilling, decoding = self.scheduler.schedule()
@@ -271,11 +274,6 @@ class Engine:
 
             kv_cache._seq_len += len(request.input_ids)
 
-            # debug：打印每个请求分配到的物理 block
-            # print(f"[DEBUG] req {request.request_id}: "
-            #     f"seq_len={kv_cache.seq_len}, "
-            #     f"blocks={kv_cache.get_block_table().tolist()}, "
-            #     f"allocated={kv_cache.allocated_cache_block_num}")
             next_token_id = sampler.sample(logits[:, -1, :], request.temperature, request.top_p)
             request.generated_ids.append(int(next_token_id.item()))
             # print(next_token_id.item())
@@ -308,12 +306,6 @@ class Engine:
             # print(B)
             kv_caches = [r.kv_cache for r in decoding]
 
-            # # debug：打印 decode 时每个请求的 block table
-            # for i, (r, c) in enumerate(zip(decoding, kv_caches)):
-            #     print(f"[DEBUG decode] req {r.request_id}: "
-            #         f"seq_len={c.seq_len}, "
-            #         f"blocks={c.get_block_table().tolist()}")
-                
             if self.use_cuda_graph and B <= self.max_batch_size:
                 logits_batch = self._decode_step_graph(decoding, kv_caches)
             else:
@@ -333,11 +325,11 @@ class Engine:
     
     def is_done(self) -> bool:
         if self.role == "p":
-            return self._done_sent
+            return self._done_sent and len(self.transfer.pending_sends) == 0
         elif self.role == "d":
             return (self.transfer.recv_done
                     and len(self.scheduler.decoding) == 0)
-        else:  # "pd"
+        else:
             return (self.no_more_requests
                     and len(self.scheduler.waiting) == 0
                     and len(self.scheduler.prefilling) == 0

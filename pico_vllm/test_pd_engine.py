@@ -27,7 +27,7 @@ def run_single(prompts, max_new_tokens):
     engine = Engine(
         model=model, tokenizer=tokenizer, block_manager=bm,
         cache_cls=PagedKVCache, device=device,
-        use_cuda_graph=False, tp_size=1, rank=0, role="pd",
+        use_cuda_graph=True, tp_size=1, rank=0, role="pd",
     )
 
     for p in prompts:
