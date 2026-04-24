@@ -4,6 +4,7 @@ from cache import KVCache, NaiveKVCache, PagedKVCache, BlockManager
 import sampler
 from scheduler import RequestStatus, Scheduler, Request
 from kv_transfer import KVTransferBase, SyncKVTransfer, NoOpKVTransfer, AsyncKVTransfer
+import time
 
 class Engine:
     """推理引擎：协调模型、调度器、Block 管理、Prefix Cache 与 PD 分离传输。
@@ -279,6 +280,7 @@ class Engine:
         self.no_more_requests = True
     
     def step(self) -> list[tuple[int, str]]:
+        # t0 = time.perf_counter()
         self.transfer.poll()  # 如果不启用则是 NoOpKVTransfer，对应操作是 no-op，不影响 role="pd"
 
         # === D 侧：检查是否有新到达请求，在 schedule 之前 ===
@@ -291,9 +293,11 @@ class Engine:
 
         prefilling, decoding = self.scheduler.schedule()
         completed_requests = []
+        # t1 = time.perf_counter()
 
         # === P 侧：逐个请求处理，动态形状，不使用 cuda graph ===
         for request in prefilling:
+            # t_match = time.perf_counter()
             matched_blocks = request.matched_blocks
             matched_len = request.matched_len
 
@@ -309,6 +313,7 @@ class Engine:
                 kv_cache.adopt_blocks(matched_blocks, matched_len)
             # adopt 后 kv_cache._seq_len = matched_len
 
+            # t_alloc = time.perf_counter()
             # 为新 token 分配 block（在 matched blocks 之后）
             kv_cache._allocate_for_prefill(new_len)
 
@@ -336,6 +341,7 @@ class Engine:
             new_token_lens = torch.tensor([new_len], dtype=torch.int32, device=self.device)
             q_start_loc = torch.tensor([0], dtype=torch.int32, device=self.device)
 
+            # t_gpu = time.perf_counter()
             with torch.no_grad():
                 logits = self.model(
                     input_ids_tensor,
@@ -350,6 +356,7 @@ class Engine:
                     q_start_loc=q_start_loc,
                 )
 
+            # t_sample = time.perf_counter()
             # 更新 seq_len 到完整长度
             kv_cache._seq_len = total_len
 
@@ -376,6 +383,12 @@ class Engine:
                     request.request_id,
                     self.tokenizer.decode(request.input_ids + request.generated_ids)
                 ))
+            # t_done = time.perf_counter()
+            # print(f"[prefill] schedule={t1-t0:.5f} "
+            #     f"match={t_alloc-t_match:.5f} "
+            #     f"alloc+tensor={t_gpu-t_alloc:.5f} "
+            #     f"gpu={t_sample-t_gpu:.5f} "
+            #     f"sample+insert={t_done-t_sample:.5f}")
 
         # === P 侧：所有 prefill 做完且用户标记 no_more_requests，则发送终止信号 ===
         if (self.role == "p"
@@ -396,10 +409,12 @@ class Engine:
             else:
                 logits_batch = self._decode_step_eager(decoding, kv_caches, B)
 
+            temps = [r.temperature for r in decoding]
+            top_ps = [r.top_p for r in decoding]
+            token_ids = sampler.sample_batch(logits_batch, temps, top_ps)
             for i, request in enumerate(decoding):
-                next_token_id = sampler.sample(logits_batch[i], request.temperature, request.top_p)
-                request.generated_ids.append(int(next_token_id.item()))
-                if next_token_id.item() == self.eos_token_id or request.is_max_len_finished():
+                request.generated_ids.append(token_ids[i])
+                if token_ids[i] == self.eos_token_id or request.is_max_len_finished():
                     request.has_finished_notification = True
                     completed_requests.append((
                         request.request_id,

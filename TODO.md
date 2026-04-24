@@ -1,5 +1,7 @@
-1、model的GQAAttention中，freqs_cis相关的实现效率不高，需要优化
-2、model的GQAAttention中，所有的cat()相关的拼接效率很低而且会阻碍cudagraph的高效编译，需要优化
-3、在Continuous Batching中，考虑增量开发一个可以在同一个batch中对不同seq变长进行Attention计算的Kernel编写
-4、chunked prefill也许是一个可行的优化
-5、paged Attention的KV cache容量计算是否可以自动化？应该是可以的。
+1、TP模式中的通信异步化和层间架构的重设计以允许通算重叠
+2、PD分离的时候传递的后端替换为NIXL以评测性能变化
+3、Scheduler的Chunked Prefill的实现、Chunk策略和其他更具体调度策略的设计
+4、Prefix共享block的写时复制（COW）语义的实现
+5、GPU to CPU的换入换出的offload驱逐策略的实现
+6、驱逐策略和Radix Tree结构的分离解耦
+7、其他CPU侧代码的整体性能优化
