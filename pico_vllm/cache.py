@@ -8,25 +8,6 @@ from typing import List
 import math
 
 class KVCache(ABC):  # 抽象接口
-    
-    # ''' update: 更新指定 layer 的 KV，输入是当前 step 计算出的 K 和 V，shape (num_heads, head_dim)
-    #     get: 获取指定 layer 的 KV，返回 shape (num_heads, head_dim) 的 K 和 V
-    #     reset: 重置 KV cache，清空所有 KV'''
-    # @abstractmethod
-    # def update(self, layer_idx: int, k: Tensor, v: Tensor) -> None:
-    #     """
-    #     将新的 k/v 写入 cache
-    #     k, v: (1, num_kv_heads, head_dim)        ← decode 时
-    #        或 (seq_len, num_kv_heads, head_dim)   ← prefill 时
-    #     """
-    #     ...
-    # @abstractmethod
-    # def get(self, layer_idx: int) -> tuple[Tensor, Tensor]:
-    #     """
-    #     返回当前层所有历史 token 的 k/v
-    #     return: k, v 各 (seq_len, num_kv_heads, head_dim)
-    #     """
-    #     ...
     @abstractmethod
     def reset(self) -> None:
         """清空 cache，开始新的请求"""
@@ -77,10 +58,15 @@ class NaiveKVCache(KVCache):
 
 # 分页的page Attention用的kv cache管理
 class PagedKVCache():
-    # block table + 物理块
-    # max_block_len: int          # 最大的block数量
-    def __init__(self, 
-                 block_manager: BlockManager, 
+    """每个请求一份的分页 KV cache 视图。
+
+    本身不持有物理内存，只记录请求占用的逻辑块列表以及它们对应的物理块 id；物理
+    KV 张量统一归 BlockManager 管。为了在 decode 热路径上避免 GPU↔CPU 标量同步，
+    同时维护一份 Python list (`physical_block_ids`) 和一份 GPU tensor
+    (`gpu_block_table`)，分配/命中 prefix cache 时增量更新两者。
+    """
+    def __init__(self,
+                 block_manager: BlockManager,
                  num_layers: int, 
                  max_seq_len: int, 
                  num_kv_heads: int, 
@@ -173,9 +159,6 @@ class PagedKVCache():
         """
         释放所有 block，归还给 block_manager
         """
-        # 之前：直接 free 所有 block
-        # self.block_manager.free(self.logical_block_ids)  # ← 用 logical id
-        # 现在：dec_ref，让 BlockManager 决定是否真正释放
         self.block_manager.free(self.logical_block_ids)
         self._seq_len = 0
         self.allocated_cache_block_num = 0
@@ -212,14 +195,7 @@ class PagedKVCache():
         """
         请求结束时调用。把所有 block 的持有通过 PrefixCache 释放。
         """
-        # 所有 block（无论是命中复用的还是自己 prefill 新分配的）
-        # 都通过 release 走一遍 RadixTree 路径
         prefix_cache.release(full_tokens)
-        
-        # 注意：这里不需要单独 free logical_block_ids
-        # 因为新分配的 block 已经通过 insert 加入了 RadixTree，
-        # release 会沿 token 路径 dec 所有经过的节点
-        
         self._seq_len = 0
         self.allocated_cache_block_num = 0
         self.physical_block_ids = []

@@ -1,3 +1,6 @@
 pico_vllm/weights/
 pico_vllm/__pycache__/
 venv/
+.vscode/
+.claude/
+CLAUDE.md

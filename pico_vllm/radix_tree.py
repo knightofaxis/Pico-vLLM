@@ -217,75 +217,7 @@ class KVCacheRadixTree:
         aligned_len = (matched_len // self.block_size) * self.block_size
         aligned_blocks_count = aligned_len // self.block_size
         return matched_blocks[:aligned_blocks_count], aligned_len
-        # return matched_blocks, matched_len
-    
-    # def inc_ref(self, tokens: List[int]) -> None:
-    #     """
-    #     沿 tokens 路径递增 ref_count。
-    #     只有当 tokens 完整覆盖 child 的 key_tokens 时，才对 child 计数。
-    #     部分覆盖（tokens 在 edge 中间停下）不计数，此时没有真实的 radix 节点能对应请求的前缀终点。
-    #     """
-    #     curr_node = self.root
-    #     i = 0
-    #     while i < len(tokens):
-    #         if tokens[i] not in curr_node.children:
-    #             break
-    #         child = curr_node.children[tokens[i]]
-    #         edge_len = len(child.key_tokens)
-    #         # 边必须被 tokens 完整覆盖
-    #         if i + edge_len > len(tokens):
-    #             break
-    #         # 且 edge 内容必须和 tokens 对应位置一致（防御：match 保证了这点，此处为严谨性）
-    #         if child.key_tokens != tokens[i : i + edge_len]:
-    #             break
-    #         child.ref_count += 1
-    #         child.update_access_time()
-    #         i += edge_len
-    #         curr_node = child
-            
-    # def dec_ref(self, tokens: List[int]) -> None:
-    #     """
-    #     当一个请求生成完毕或被终止时调用。
-        
-    #     输入: 该请求使用过的完整 Token 序列。
-        
-    #     内部行为:
-    #         1. 沿着匹配该 tokens 的路径向下走。
-    #         2. 将途径所有节点的 ref_count 减 1。
-    #         3. 如果某个节点的 ref_count 降为 0：
-    #            - 更新其 last_access_time。
-    #            - 将其加入到 `self.evictable_queue` 中备用。
-    #     """
-    #     curr_node = self.root
-    #     i = 0
-    #     while i < len(tokens):
-    #         if tokens[i] not in curr_node.children:
-    #             break
-    #         child = curr_node.children[tokens[i]]
-    #         edge_len = len(child.key_tokens)
-    #         if i + edge_len > len(tokens):
-    #             break
-    #         if child.key_tokens != tokens[i : i + edge_len]:
-    #             break
 
-    #         child.ref_count -= 1
-    #         assert child.ref_count >= 0, (
-    #             f"ref_count underflow on node with key_tokens={child.key_tokens}"
-    #         )
-
-    #         if child.ref_count == 0:
-    #             child.update_access_time()
-    #             if child.is_leaf():
-    #                 self.evictable_queue.put(
-    #                     (child.last_access_time, id(child), child)
-    #                 )
-
-    #         i += edge_len
-    #         curr_node = child
-
-    ####################################################
-    # 修改后的api。前面的需要废弃
-    ####################################################
     def match_prefix(self, tokens: list[int]) -> tuple[list[int], int, 'KVCacheRadixTreeNode']:
         """
         找最长前缀匹配。

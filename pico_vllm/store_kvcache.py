@@ -25,15 +25,8 @@ def store_kvcache_kernel(
     block_id = slot // BLOCK_SIZE
     offset = slot % BLOCK_SIZE
 
-    # 3. 计算源数据 (K/V) 的一维内存偏移
-    # 假设输入是连续的: stride_token = n_kv_heads * HEAD_DIM, stride_head = HEAD_DIM
+    # 3. 用 stride 计算源数据 (K/V) 的一维内存偏移，不假设输入连续
     dim_offsets = tl.arange(0, HEAD_DIM)
-    # src_offset = pid_token * (N_KV_HEADS * HEAD_DIM) + pid_head * HEAD_DIM + dim_offsets
-
-    # k_vec = tl.load(k_ptr + src_offset)
-    # v_vec = tl.load(v_ptr + src_offset)
-
-    # 用 stride 计算源偏移，不假设连续
     src_offset = pid_token * stride_k_token \
                + pid_head  * stride_k_head  \
                + dim_offsets * stride_k_dim

@@ -84,11 +84,7 @@ class RoPE(nn.Module):
         t = torch.arange(max_seq_len).float()
         # angles: (max_seq_len, head_dim//2)
         angles = torch.outer(t, freqs)
-        # cos/sin 表: (max_seq_len, head_dim)
-        # 拼接两份，对应 concat 式 RoPE
-        # cos_table = torch.cat([angles.cos(), angles.cos()], dim=-1)
-        # sin_table = torch.cat([angles.sin(), angles.sin()], dim=-1)
-        
+        # cos/sin 表: (max_seq_len, head_dim)，拼接两份对应 concat 式 RoPE
         # register_buffer: 跟随模型 device 移动，但不是参数
         self.register_buffer('cos_table', torch.cat([angles.cos(), angles.cos()], dim=-1), persistent=False)
         self.register_buffer('sin_table', torch.cat([angles.sin(), angles.sin()], dim=-1), persistent=False)
@@ -128,11 +124,15 @@ class RoPE(nn.Module):
         return q_rot, k_rot
 
 class GQAAttention(nn.Module):
+    """Grouped-Query Attention：融合 RoPE + KV cache 写入 + paged attention。
+
+    prefill 用 Triton paged_prefill，decode 用 paged_decode；两条路径共享 KV cache
+    写入 kernel。TP 场景下 o_proj 输出会做一次 all_reduce。
+    """
     layer_idx: Tensor
     def __init__(self, cfg: ModelConfig, layer_idx):
         super().__init__()
         self.cfg = cfg
-        # self.layer_idx = Tensor(layer_idx)
         self.register_buffer(
             'layer_idx', 
             torch.tensor(layer_idx, dtype=torch.int32), 
@@ -151,19 +151,6 @@ class GQAAttention(nn.Module):
             bias=True
         )
 
-    # def _prefill_attention(self, q: Tensor, k: Tensor, v: Tensor):
-        
-    #     # SDPA（B=1，标准 causal attention）
-    #     # q/k/v: (B, seq, n_heads, head_dim) → 转成 SDPA 期望的格式
-    #     q = q.transpose(1, 2)  # (B, n_heads, seq, head_dim)
-    #     k = k.transpose(1, 2)
-    #     v = v.transpose(1, 2)
-    #     k = k.repeat_interleave(self.cfg.num_kv_groups, dim=1)
-    #     v = v.repeat_interleave(self.cfg.num_kv_groups, dim=1)
-        
-    #     out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-    #     # (B, n_heads, seq, head_dim) → (B, seq, hidden)
-    #     return out.transpose(1, 2).contiguous().view(q.shape[0], -1, self.local_hidden)
     def _prefill_attention(self, q, kv_cache_k, kv_cache_v,
                         block_table, context_lens, new_token_lens, q_start_loc):
         """
@@ -264,7 +251,6 @@ class GQAAttention(nn.Module):
 
         # RoPE（两条路径共用）
         q, k = RoPE.apply_rope(q, k, cos, sin)
-        # print(v.is_contiguous())
         # k/v reshape 成 (total_tokens, n_kv_heads, head_dim) 给 store kernel
         k_flat = k.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
         v_flat = v.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
@@ -300,15 +286,7 @@ class GQAAttention(nn.Module):
         k = k.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
         v = v.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
 
-        # RoPE（两条路径共用）
-        # q, k = RoPE.apply_rope(q, k, cos, sin)
-        # # print(v.is_contiguous())
-        # # k/v reshape 成 (total_tokens, n_kv_heads, head_dim) 给 store kernel
-        # k_flat = k.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-        # v_flat = v.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-
-        # # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
-        # store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
+        # RoPE + KV cache 写入 合并在一个 Triton kernel 里
         q_rot = fused_decode_rope_and_cache(
             q, k, v, cos, sin, 
             kv_cache_k, kv_cache_v, 
@@ -324,11 +302,10 @@ class GQAAttention(nn.Module):
         return output
     
 class SwiGLUFFN(nn.Module):
+    """SwiGLU FFN：gate 与 up 投影合并成一次 matmul，decode 路径用 Triton 融合激活。"""
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        # self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        # self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
         self.gate_up_proj = nn.Linear(
             cfg.hidden_size, cfg.local_intermediate_size * 2, bias=False
         )
@@ -336,8 +313,6 @@ class SwiGLUFFN(nn.Module):
 
     def forward(self, x):
         # x: (B, seq_len, hidden_size)
-        # gate = self.gate_proj(x)  # (B, seq_len, intermediate_size)
-        # up = self.up_proj(x)  # (B, seq_len, intermediate_size)
         gate_up = self.gate_up_proj(x)
         gate, up = gate_up.split(self.cfg.local_intermediate_size, dim=-1)
         output = self.down_proj(F.silu(gate) * up)  # (B, seq_len, hidden_size)
@@ -363,6 +338,7 @@ class SwiGLUFFN(nn.Module):
 # Transformer block
 #############################################################
 class TransformerBlock(nn.Module):
+    """单个 Transformer 层：pre-norm + GQA + pre-norm + SwiGLU-FFN，带残差相加。"""
     def __init__(self, cfg: ModelConfig, layer_idx):
         super().__init__()
         self.cfg = cfg
@@ -419,6 +395,10 @@ class TransformerBlock(nn.Module):
 # Model Assembly to Qwen2.5-1.5B
 #############################################################
 class Qwen25_15B(nn.Module):
+    """Qwen2.5-1.5B：embedding + N 层 TransformerBlock + final RMSNorm + tied lm_head。
+
+    暴露两个入口：forward（prefill 或统一路径）与 forward_decode（单步 decode，用于 CUDA Graph）。
+    """
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg

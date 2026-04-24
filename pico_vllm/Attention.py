@@ -40,8 +40,6 @@ def Decode_Paged_GQAAttention_Kernel(
 
     context_len = tl.load(context_lens + pid_batch)
     if context_len == 0:
-        # 写零输出，直接返回
-        # tl.store(out + pid_batch * (HEAD_DIM * N_HEAD) + pid_head * (HEAD_DIM) + tl.arange(0, HEAD_DIM), tl.zeros((HEAD_DIM,), dtype=tl.float32))
         return
     max_block_index = tl.cdiv(context_len, BLOCK_SIZE)  # 向上取整
     offs_kv = tl.arange(0, BLOCK_SIZE * HEAD_DIM)
@@ -56,27 +54,20 @@ def Decode_Paged_GQAAttention_Kernel(
         token_start = block_idx * BLOCK_SIZE
         valid_in_block = tl.minimum(BLOCK_SIZE, context_len - token_start)
         kv_token_mask = tl.arange(0, BLOCK_SIZE * HEAD_DIM) < valid_in_block * HEAD_DIM
-        # kv_mask = token_mask[:, None] & (tl.arange(0, HEAD_DIM)[None, :] < HEAD_DIM)
-        # # 展平给 load 用
-        # kv_mask_flat = tl.reshape(kv_mask, (BLOCK_SIZE * HEAD_DIM,))
 
         k_ptrs = k_cache + base + offs_kv
         # k_block: (block_size, head_dim)
         k_block = tl.load(k_ptrs, mask = kv_token_mask, other=0.0)
-        # k_block = tl.zeros((BLOCK_SIZE * HEAD_DIM,), dtype=tl.bfloat16)
         k_block = tl.reshape(k_block, (BLOCK_SIZE, HEAD_DIM))
         v_ptrs = v_cache + base + offs_kv
         v_block = tl.load(v_ptrs, mask = kv_token_mask, other=0.0)
-        # v_block = tl.zeros((BLOCK_SIZE * HEAD_DIM,), dtype=tl.bfloat16)
         v_block = tl.reshape(v_block, (BLOCK_SIZE, HEAD_DIM))
 
         # mask 最后一个 block 的无效 token
         valid = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE) < context_len
-        # s = tl.dot(k_block, q_vec)
         q_row = tl.reshape(q_vec, (1, HEAD_DIM))           # (1, HEAD_DIM)
         s = tl.sum(k_block * q_row, axis=1)                 # (BLOCK_SIZE,)
         s = s.to(tl.float32) * scale
-        # s = tl.reshape(s, (BLOCK_SIZE, )) * scale
         s = tl.where(valid, s, float('-inf'))
 
         m_new = tl.maximum(m, tl.max(s))
@@ -84,12 +75,11 @@ def Decode_Paged_GQAAttention_Kernel(
         p = tl.exp(s - m_new)          # 当前 block 的权重
 
         l = l * alpha + tl.sum(p)
-        # o = o * alpha + tl.dot(tl.reshape(p, (1, BLOCK_SIZE)), tl.cast(v_block ,tl.float32))
         p_col = tl.reshape(p, (BLOCK_SIZE, 1))             # (BLOCK_SIZE, 1)
         o = o * alpha + tl.sum(p_col * v_block, axis=0)    # (HEAD_DIM,)
         m = m_new
 
-    o = o / l  # (1, HEAD_DIM)
+    o = o / l  # (HEAD_DIM,)
     o_casted = tl.cast(o, out.dtype.element_ty)
     
     tl.store(out + pid_batch * (HEAD_DIM * N_HEAD) + pid_head * (HEAD_DIM) + tl.arange(0, HEAD_DIM), o_casted)
@@ -103,9 +93,6 @@ def paged_decode_attention(q, k_cache, v_cache, block_table, context_lens,
 
     out = torch.empty(B, N_HEAD, 1, HEAD_DIM, device=q.device, dtype=q.dtype)
 
-    # k_cache 的最大合法地址
-    # max_physical_id = block_table.max().item()
-    # max_offset = max_physical_id * N_KV_HEAD * BLOCK_SIZE * HEAD_DIM
     grid = (B, N_HEAD)
     Decode_Paged_GQAAttention_Kernel[grid](
         q, k_cache, v_cache, block_table, context_lens,

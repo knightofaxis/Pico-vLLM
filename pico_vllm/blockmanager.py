@@ -9,7 +9,16 @@ class pagedblocktype(Enum):
     CPU = "cpu"
     NONE = "none"  # 表示未分配
 class BlockManager:
-    def __init__(self, 
+    """集中管理 KV cache 的物理显存/内存分页。
+
+    - GPU / CPU 各持一块大的连续 KV 张量（pool），分成固定大小的 block。
+    - 维护 "逻辑 block id → (设备类型, 物理 block id)" 的映射，同一逻辑 block 可以
+      在 swap_in/swap_out 过程中在 GPU/CPU 之间迁移而保持对外 id 不变。
+    - Prefix cache 的驱逐通过 `_evict_callback` 注入：当空闲不足时先触发回调尝试
+      驱逐，再抛 OOM。
+    - 引用计数 (`logical_ref_count`) 用于 prefix cache 的共享释放。
+    """
+    def __init__(self,
                  num_gpu_blocks: int, 
                  num_cpu_blocks: int, 
                  block_size: int, 
@@ -97,11 +106,8 @@ class BlockManager:
             block_type, physical_block_id = self.block_mapping[block_id]
             if block_type == pagedblocktype.GPU:
                 self.gpu_free_blocks.append(physical_block_id)
-                # 归零物理块的引用计数（应该已经归零，注释了）
-                # self.gpu_block_ref_count[physical_block_id] = 0
             elif block_type == pagedblocktype.CPU:
                 self.cpu_free_blocks.append(physical_block_id)
-                # self.cpu_block_ref_count[physical_block_id] = 0
             else:
                 raise RuntimeError(f"Block {block_id} is not allocated")
             # 更新 block_mapping
@@ -133,7 +139,6 @@ class BlockManager:
         """
         把 GPU 上的 block 换出到 CPU
         """
-        cpu_block_ids = []
         for block_id in block_ids:
             block_type, physical_block_id = self.block_mapping[block_id]
             if block_type != pagedblocktype.GPU:
@@ -144,13 +149,11 @@ class BlockManager:
             )
             self.gpu_free_blocks.append(physical_block_id)  # GPU 块释放
             self.block_mapping[block_id] = (pagedblocktype.CPU, cpu_block_id)  # 更新映射
-            cpu_block_ids.append(cpu_block_id)
 
     def swap_in(self, block_ids: List[int]) -> None:
         """
         把 CPU 上的 block 换回 GPU
         """
-        gpu_block_ids = []
         for block_id in block_ids:
             block_type, physical_block_id = self.block_mapping[block_id]
             if block_type != pagedblocktype.CPU:
@@ -161,7 +164,6 @@ class BlockManager:
             )
             self.cpu_free_blocks.append(physical_block_id)  # CPU 块释放
             self.block_mapping[block_id] = (pagedblocktype.GPU, gpu_block_id)  # 更新映射
-            gpu_block_ids.append(gpu_block_id)
 
     @property
     def num_free_blocks(self) -> int:

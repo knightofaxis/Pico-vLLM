@@ -177,11 +177,6 @@ class SyncKVTransfer(KVTransferBase):
         pass
 
 
-# Phase 2 时在这里加：
-# class AsyncKVTransfer(KVTransferBase):
-#     """异步非阻塞传输，isend/irecv + poll"""
-#     ...
-
 class AsyncKVTransfer(KVTransferBase):
     """Phase 2：异步非阻塞传输"""
 

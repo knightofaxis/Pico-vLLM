@@ -1,8 +1,6 @@
 from enum import Enum
-import torch
-from typing import List, Optional
-from dataclasses import dataclass
-from cache import KVCache, NaiveKVCache, PagedKVCache
+from typing import List
+from cache import PagedKVCache
 from radix_tree import KVCacheRadixTreeNode
 
 
@@ -13,16 +11,19 @@ class RequestStatus(Enum):
     FINISHED = "finished"  # 已完成，未释放资源
     CLOSED = "closed"  # 已完成，已在radix tree层面释放资源
 
-''' 请求对象，包含请求的所有信息和状态
-- request_id: 请求 ID，唯一标识一个请求
-- input_ids: 输入的 token ids，shape (1, init_seq_len)，包含整个 prompt
-- generated_ids: 已经生成的 token ids，shape (1, )，初始为 空
-- max_new_tokens: 最多生成多少个 token
-- temperature: 采样温度，传递给 sampler
-- top_p: top-p 截断，传递给 sampler
-- kv_cache: 每个请求独享一个 KV cache 实例，存储生成过程中的 KV 状态
-'''
 class Request:
+    """一个生成请求的所有状态。
+
+    字段含义：
+    - request_id: 请求 ID，唯一标识一个请求。
+    - input_ids: 整个 prompt 的 token ids。
+    - generated_ids: 已生成的 token ids，初始为空。
+    - max_new_tokens / temperature / top_p: 生成与采样参数。
+    - kv_cache: 每个请求独享一个 KV cache 实例。
+    - request_status: 调度状态机中的位置（waiting / prefill / decoding / finished / closed）。
+    - has_finished_notification: 由 engine 通知 scheduler 该请求已停止；状态迁移由 scheduler 负责。
+    - matched_blocks / matched_len / last_node: prefix cache 命中信息，prefill 时用。
+    """
     request_id: int
     input_ids: List[int]  # (1, init_seq_len)，包含整个 prompt
     generated_ids: List[int]  # (1, )，包含已经生成的 token ids，初始为 空
@@ -63,6 +64,13 @@ class Request:
         return len(self.input_ids) + len(self.generated_ids)
 
 class Scheduler:
+    """请求调度器，用 waiting / prefilling / decoding / finished 四个队列做状态机。
+
+    `schedule()` 每次被 engine 调用一次，把已收到 finished notification 的请求移出
+    decoding，把完成 prefill 的整批搬到 decoding，并从 waiting 尽可能补齐到
+    `max_num_seqs` 的并发度（先到先服务）。engine 负责实际的 prefill / decode 计算
+    和对 `has_finished_notification` 的写入。
+    """
     _next_request_id: int  # 用于生成唯一的 request_id
     max_num_seqs: int  # 同时处理的最大请求数，超过这个数的新请求会排队等待
     kv_cache_cls : type[PagedKVCache]  # KVCache 的类，用于创建请求的 KV cache 实例
@@ -142,23 +150,25 @@ class Scheduler:
     - decoding: 正在 decode 的请求
     '''
     def schedule(self) -> tuple[List[Request], List[Request]]:
-        
-        # 1. 对 decoding 队列中的请求进行 decode，完成后移动到 finished 队列
-        for request in self.decoding[:]:
-            # is_max_len_finished 由 scheduler判断
-            # has_finished_notification 由 engine 在 decode_step 后更新，解耦两者的逻辑，scheduler 不直接接触 tokenizer 和 eos_token_id
-            if request.has_finished_notification == True:
-                request.request_status = RequestStatus.FINISHED
-                self.decoding.remove(request)
-                self.finished.append(request)
 
-        # 2. 对 prefilling 队列中的请求进行 prefill，完成后移动到 decoding 队列
-        for request in self.prefilling[:]:
-            # prefill 完成后：
+        # 1. 对 decoding 队列中的请求进行 decode，完成后移动到 finished 队列
+        # has_finished_notification 由 engine 在 decode_step 后更新，scheduler 不直接
+        # 接触 tokenizer 和 eos_token_id；用列表推导一次 O(n) 重建代替 list.remove 的 O(n^2)。
+        still_decoding: List[Request] = []
+        for request in self.decoding:
+            if request.has_finished_notification:
+                request.request_status = RequestStatus.FINISHED
+                self.finished.append(request)
+            else:
+                still_decoding.append(request)
+        self.decoding = still_decoding
+
+        # 2. prefilling 整批搬到 decoding —— 一次 extend + clear 比逐个 remove 高效
+        for request in self.prefilling:
             request.request_status = RequestStatus.DECODING
-            self.prefilling.remove(request)
-            self.decoding.append(request)
-        
+        self.decoding.extend(self.prefilling)
+        self.prefilling.clear()
+
         # 3. 从 waiting 队列中取出请求，放入 prefilling 队列，直到达到 max_batch_size
         # 不进行kv_cache的创建和初始化
         while self.waiting and self.num_in_progress < self.max_num_seqs:
@@ -166,8 +176,6 @@ class Scheduler:
             request = self.waiting.pop(0)
             request.request_status = RequestStatus.PREFILL
             self.prefilling.append(request)
-            # kv cache必须定长，否则报错
-            # request.kv_cache = self.kv_cache_cls(**self.kv_cache_kwargs)
 
         return self.prefilling, self.decoding
 
