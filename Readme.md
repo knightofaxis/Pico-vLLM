@@ -78,55 +78,22 @@ python download_qwen.py
 
 ### 单卡推理入口示例
 
-```python
-from pico_vllm.model import Qwen25_15B, ModelConfig
-from pico_vllm.weights import load_weights
-from pico_vllm.engine import Engine
-from pico_vllm.blockmanager import BlockManager
-from pico_vllm.cache import PagedKVCache
-from transformers import AutoTokenizer
-import torch
-
-cfg = ModelConfig()
-model = Qwen25_15B(cfg)
-model = load_weights(model, "./weights")
-model = model.to(torch.bfloat16).to("cuda")
-
-tokenizer = AutoTokenizer.from_pretrained("./weights")
-
-bm = BlockManager(
-    num_gpu_blocks=500, num_cpu_blocks=0,
-    block_size=16, num_layers=cfg.num_hidden_layers,
-    num_kv_heads=cfg.num_key_value_heads,
-    head_dim=cfg.head_dim, dtype=torch.bfloat16,
-)
-
-engine = Engine(
-    model=model, tokenizer=tokenizer, block_manager=bm,
-    cache_cls=PagedKVCache, device="cuda",
-    use_cuda_graph=True,
-    enable_prefix_cache=True,
-)
-
-engine.submit("The capital of France is", max_new_tokens=20, temperature=0, top_p=1.0)
-
-while True:
-    completed = engine.step()
-    for req_id, text in completed:
-        print(f"[{req_id}] {text}")
-    if completed:
-        break
+```bash
+cd pico_vllm/
+python run_single.py
 ```
 
 ### 多卡（2卡）推理入口示例： TP=2
 
 ```bash
+cd pico_vllm/
 torchrun --nproc_per_node=2 run_tp.py
 ```
 
 ### 多卡（4卡）推理入口示例： TP=2 + PD分离
 
 ```bash
+cd pico_vllm/
 torchrun --nproc_per_node=4 run_tp_pd.py
 ```
 
@@ -135,6 +102,13 @@ torchrun --nproc_per_node=4 run_tp_pd.py
 ```bash
 cd pico_vllm
 python benchmarks/benchmark_prefix_cache_long.py
+```
+
+### 运行 TP+PD 异构测试
+
+```bash
+cd pico_vllm
+torchrun --nproc_per_node=3 test/test_hetero_tp_pd.py
 ```
 
 ## 项目结构
@@ -170,8 +144,8 @@ PicovLLM/
 
 ## 博客
 
-- 我的博客：https://koas-w.github.io/
-- Pico-vLLM开发日志系列：https://koas-w.github.io/tags/vllm/
+- 我的博客：[Fain的blog](https://koas-w.github.io/)
+- Pico-vLLM开发日志系列：[Pico-vLLM开发日志](https://koas-w.github.io/tags/vllm/)
 
 ## Road Map 未来计划
 
