@@ -41,7 +41,7 @@ def main():
         model=model, tokenizer=tokenizer, block_manager=bm,
         cache_cls=PagedKVCache, device=device,
         use_cuda_graph=True,
-        tp_size=tp_size, rank=rank,
+        local_tp_size=tp_size, rank=rank,
     )
 
     # 提交请求

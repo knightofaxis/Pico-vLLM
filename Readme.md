@@ -1,18 +1,18 @@
 # Pico-vLLM
 
-从零手写的 LLM 推理引擎，单人一个月开发。在 vLLM 的 PagedAttention 架构上融合 SGLang 的 RadixAttention 设计，实现了工业框架的核心特性栈。
+这是一个从零手写的 LLM 推理引擎，以个人项目形式开发。在 vLLM 的 PagedAttention 架构上融合 SGLang 的 RadixAttention 设计，实现了工业框架的核心特性栈。
 
 目标模型：Qwen2.5-1.5B（bfloat16）
 
 ## 亮点
 
-**推理引擎**：Qwen2.5-1.5B 从零实现，逐层数值对齐 HuggingFace。5 个手写 Triton kernel，CUDA Graph 加速，Continuous Batching。单卡 97 tok/s，带宽利用率 78%，超过 vLLM 同硬件的 95 tok/s。
+**推理引擎**：支持 Qwen2.5-1.5B 模型，输出对齐 HuggingFace。通过 Triton kernel 的 kernel fusion 实现、CUDA Graph 加速、Continuous Batching和 Prefix Caching 实现推理加速。在 5070 单卡上单 batch 实现 Qwen2.5-1.5B 推理速度 97 tok/s，带宽利用率 78%，超过 vLLM 在同测试场景下的 95 tok/s。
 
-**Prefix Caching**：在 vLLM 的 block-level BlockManager 上实现 SGLang 风格的 token-level radix tree。双层引用计数模型（lock_ref + logical_ref_count），LRU 驱逐 + lazy deletion。2083-token 共享前缀下 warm TTFT 平均 2.56x 加速，峰值 3.45x。
+**Prefix Caching**：在 vLLM 的 block-level BlockManager 上实现 SGLang 风格的 token-level radix tree。通过实现双层引用计数模型（lock_ref + logical_ref_count），实现驱逐策略和实际缓存释放时机的解耦。实现了 LRU 驱逐策略 + lazy deletion 驱逐实现。在 2000-token 的共享前缀测试场景下下，实现 TTFT 平均 2.56x，峰值 3.45x 的加速比。
 
-**分布式推理**：Tensor Parallelism + PD 分离（同步/异步两版传输层）。支持异构并行度组合（P(TP=2)+D(TP=1) 和反向），解决跨并行度的 KV head 重映射。PD 分离 ITL 提升 5.2x，tail latency 50ms→2ms。
+**分布式推理**：实现了 Tensor Parallelism + PD 分离（NCCL后端，支持同步/异步模式）。支持异构并行度组合（P(TP=2)+D(TP=1) ，或者反过来），解决跨并行度的 KV head 重映射。通过 PD 分离，实现 ITL 提升 5.2x，tail latency 从 ~50ms 降低到 ~2ms。
 
-**性能分析**：4 次 nsys profiling，跨硬件对比（5090 PCIe vs B200 NVLink）。AllReduce 延迟拆解（PCIe 下占双卡 GPU 时间 48%，NVLink 下 2-5%）。CPU overhead 仅占总执行时间 6%。
+**性能分析**：完整的 nsys profiling 和跨硬件对比（5090 PCIe vs B200 NVLink）（详情参考[Fain的blog](https://koas-w.github.io/)）。在 Qwen2.5-1.5B 模型的 ~2000 token 请求长度下， CPU overhead 仅占总执行时间 6%。
 
 ## 特性清单
 
@@ -43,8 +43,7 @@
 | 指标 | Pico-vLLM | vLLM (同硬件) |
 |:---|:---:|:---:|
 | Decode Throughput | 97 tok/s | 95 tok/s |
-| 带宽利用率 | 78% | — |
-| CPU Overhead 占比 | 6% | 62% (v0.5 优化前) |
+| 带宽利用率 | 78% | 77% |
 
 ### Prefix Cache（2083-token 共享前缀）
 
@@ -74,10 +73,10 @@
 ### 下载权重
 
 ```bash
-bash download_weights.sh
+python download_qwen.py
 ```
 
-### 单卡推理
+### 单卡推理入口示例
 
 ```python
 from pico_vllm.model import Qwen25_15B, ModelConfig
@@ -119,17 +118,16 @@ while True:
         break
 ```
 
-### 多卡 TP
+### 多卡（2卡）推理入口示例： TP=2
 
 ```bash
-torchrun --nproc_per_node=2 your_script.py
+torchrun --nproc_per_node=2 run_tp.py
 ```
 
-### 运行测试
+### 多卡（4卡）推理入口示例： TP=2 + PD分离
 
 ```bash
-cd pico_vllm
-python -m pytest tests/ -v
+torchrun --nproc_per_node=4 run_tp_pd.py
 ```
 
 ### 运行 Benchmark
@@ -165,9 +163,9 @@ PicovLLM/
     │   ├── swiglu.py
     │   └── store_kvcache.py
     │
-    ├── tests/                # 单元测试
+    ├── tests/                # 单元测试（有废弃）
     ├── benchmarks/           # 性能测试
-    └── profiling/            # nsys profiling 结果
+    └── profiling/            # profiling 脚本和结果
 ```
 
 ## 博客
@@ -175,7 +173,7 @@ PicovLLM/
 - 我的博客：https://koas-w.github.io/
 - Pico-vLLM开发日志系列：https://koas-w.github.io/tags/vllm/
 
-## 未来计划
+## Road Map 未来计划
 
 - TP 通信异步化 + 层间通算重叠
 - PD 传输后端替换为 NIXL
