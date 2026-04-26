@@ -1,0 +1,11 @@
+# Core runtime requirements from Readme.md.
+# Install a CUDA-enabled PyTorch build appropriate for your driver/CUDA stack.
+torch>=2.1
+triton>=2.1
+transformers>=4.0
+safetensors>=0.4
+
+# Useful for the repository's test suite and profiling/benchmark scripts.
+pytest>=7.0
+numpy>=1.24
+matplotlib>=3.7

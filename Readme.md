@@ -69,7 +69,9 @@
 - PyTorch 2.1+ (with CUDA)
 - Triton 2.1+
 - transformers
-
+```
+一键配置环境：bash scripts/venv.sh
+```
 ### 下载权重
 
 ```bash
