@@ -29,6 +29,10 @@ class Engine:
                  enable_prefix_cache=True,
                  manual_seed=42,
                  ):
+        device = torch.device(device)
+        if device.type != "cuda":
+            use_cuda_graph = False
+
         self.model = model.to(device)
         # self.sampler = sampler
         self.tokenizer = tokenizer
@@ -52,7 +56,8 @@ class Engine:
         self.rank = rank
         if local_tp_size > 1:
             torch.manual_seed(manual_seed)
-            torch.cuda.manual_seed(manual_seed)
+            if self.device.type == "cuda":
+                torch.cuda.manual_seed(manual_seed)
         
         ### PD 分离相关设置 ###
         self.role = role
@@ -90,13 +95,16 @@ class Engine:
             self.prefix_cache = None
 
         # CUDA Graph 只在有 decode 职责时 build
-        if use_cuda_graph and role in ("d", "pd"):
+        if self.use_cuda_graph and role in ("d", "pd"):
             self._build_cuda_graph()
 
         self.model.eval()
         
     def _build_cuda_graph(self):
         """预分配静态 buffer 并 capture graph，只做一次"""
+        if self.device.type != "cuda":
+            raise RuntimeError("CUDA Graph requires a CUDA device.")
+
         # 静态 buffer
         self.static_input_ids    = torch.zeros(self.max_batch_size, 1, dtype=torch.long, device=self.device)
         self.static_slot_mapping = torch.zeros(self.max_batch_size, dtype=torch.int32, device=self.device)

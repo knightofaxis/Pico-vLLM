@@ -26,6 +26,7 @@ class ModelConfig:
     tie_word_embeddings: bool = True
 
     #### 动态参数 ####
+    use_cuda: bool | None = None
     tp_size: int = 1
     tp_rank: int = 0
     tp_group: object = None
@@ -41,6 +42,13 @@ class ModelConfig:
     def num_kv_groups(self):
         # 每个 KV 头服务几个 Q 头
         return self.num_attention_heads // self.num_key_value_heads
+
+    @property
+    def device(self) -> torch.device:
+        use_cuda = torch.cuda.is_available() if self.use_cuda is None else self.use_cuda
+        if use_cuda and not torch.cuda.is_available():
+            raise RuntimeError("ModelConfig.use_cuda=True but CUDA is not available.")
+        return torch.device("cuda" if use_cuda else "cpu")
 
     @property
     def local_num_attention_heads(self):

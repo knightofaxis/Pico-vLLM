@@ -8,9 +8,11 @@ from transformers import AutoTokenizer
 import torch
 
 cfg = ModelConfig()
+device = cfg.device
+use_cuda = device.type == "cuda"
 model = Qwen25_15B(cfg)
 model = load_weights(model, "./weights")
-model = model.to(torch.bfloat16).to("cuda")
+model = model.to(torch.bfloat16).to(device)
 
 tokenizer = AutoTokenizer.from_pretrained("./weights")
 
@@ -19,12 +21,13 @@ bm = BlockManager(
     block_size=16, num_layers=cfg.num_hidden_layers,
     num_kv_heads=cfg.num_key_value_heads,
     head_dim=cfg.head_dim, dtype=torch.bfloat16,
+    device=device,
 )
 
 engine = Engine(
     model=model, tokenizer=tokenizer, block_manager=bm,
-    cache_cls=PagedKVCache, device="cuda",
-    use_cuda_graph=True,
+    cache_cls=PagedKVCache, device=device,
+    use_cuda_graph=use_cuda,
     enable_prefix_cache=True,
 )
 

@@ -25,8 +25,10 @@ class BlockManager:
                  num_layers: int,
                  num_kv_heads: int, 
                  head_dim: int, 
-                 dtype: dtype):
+                 dtype: dtype,
+                 device='cuda'):
         self.dtype = dtype
+        self.device = torch.device(device)
         ########## 物理块索引 ##########
         self.num_physical_gpu_blocks = num_gpu_blocks
         self.num_physical_cpu_blocks = num_cpu_blocks
@@ -38,7 +40,7 @@ class BlockManager:
         self.gpu_free_blocks: deque[int] = deque(range(num_gpu_blocks))
         self.gpu_kv_cache = torch.zeros(
             2, num_layers, num_gpu_blocks, num_kv_heads, block_size, head_dim,
-            device='cuda', dtype=dtype
+            device=self.device, dtype=dtype
         )
         
         # CPU pool（offload 目标）
@@ -46,7 +48,7 @@ class BlockManager:
         self.cpu_kv_cache = torch.zeros(
             2, num_layers, num_cpu_blocks, num_kv_heads, block_size, head_dim,
             device='cpu', dtype=dtype,
-            pin_memory=True  # ← 关键：pin_memory 让 CPU→GPU 传输更快
+            pin_memory=self.device.type == 'cuda'  # ← 关键：pin_memory 让 CPU→GPU 传输更快
         )
         
         ########## 逻辑块索引 ##########
@@ -69,8 +71,10 @@ class BlockManager:
     
     def allocate(self, num_blocks: int = 1) -> List[int]:
         while self.num_free_blocks < num_blocks:
+            if self._evict_callback is None:
+                break
             needed = num_blocks - self.num_free_blocks
-            evicted_count = self._evict_callback(needed) # type: ignore
+            evicted_count = self._evict_callback(needed)
             if evicted_count == 0:
                 break   # 驱逐不出来了，真 OOM
         
