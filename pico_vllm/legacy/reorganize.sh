@@ -16,19 +16,19 @@ echo "=== Step 1: 创建目录结构 ==="
 
 cd pico_vllm
 
-mkdir -p kernels
+mkdir -p ops/triton
 mkdir -p tests
 mkdir -p benchmarks
 mkdir -p profiling
 
 echo "=== Step 2: 移动 Triton kernel ==="
 
-mv Attention.py                    kernels/attention.py
-mv fused_add_norm.py               kernels/fused_add_norm.py
-mv Fused_RoPE_KVcache_store.py     kernels/fused_rope_kvcache_store.py
-mv SwiGLU.py                       kernels/swiglu.py
-mv store_kvcache.py                kernels/store_kvcache.py
-touch kernels/__init__.py
+mv Attention.py                    ops/triton/attention.py
+mv fused_add_norm.py               ops/triton/fused_add_norm.py
+mv Fused_RoPE_KVcache_store.py     ops/triton/fused_rope_kvcache_store.py
+mv SwiGLU.py                       ops/triton/swiglu.py
+mv store_kvcache.py                ops/triton/store_kvcache.py
+touch ops/triton/__init__.py
 
 echo "=== Step 3: 移动测试文件 ==="
 
@@ -59,30 +59,30 @@ EOF
 
 echo "=== Step 7: 更新 kernel import 路径 ==="
 
-find . -name "*.py" -not -path "./kernels/*" | xargs sed -i \
-    's/from Attention import/from kernels.attention import/g'
-find . -name "*.py" -not -path "./kernels/*" | xargs sed -i \
-    's/import Attention/from kernels import attention as Attention/g'
+find . -name "*.py" -not -path "./ops/triton/*" | xargs sed -i \
+    's/from Attention import/from ops.triton.attention import/g'
+find . -name "*.py" -not -path "./ops/triton/*" | xargs sed -i \
+    's/import Attention/from ops.triton import attention as Attention/g'
 
-find . -name "*.py" -not -path "./kernels/*" | xargs sed -i \
-    's/from fused_add_norm import/from kernels.fused_add_norm import/g'
-find . -name "*.py" -not -path "./kernels/*" | xargs sed -i \
-    's/import fused_add_norm/from kernels import fused_add_norm/g'
+find . -name "*.py" -not -path "./ops/triton/*" | xargs sed -i \
+    's/from fused_add_norm import/from ops.triton.fused_add_norm import/g'
+find . -name "*.py" -not -path "./ops/triton/*" | xargs sed -i \
+    's/import fused_add_norm/from ops.triton import fused_add_norm/g'
 
-find . -name "*.py" -not -path "./kernels/*" | xargs sed -i \
-    's/from Fused_RoPE_KVcache_store import/from kernels.fused_rope_kvcache_store import/g'
-find . -name "*.py" -not -path "./kernels/*" | xargs sed -i \
-    's/import Fused_RoPE_KVcache_store/from kernels import fused_rope_kvcache_store as Fused_RoPE_KVcache_store/g'
+find . -name "*.py" -not -path "./ops/triton/*" | xargs sed -i \
+    's/from Fused_RoPE_KVcache_store import/from ops.triton.fused_rope_kvcache_store import/g'
+find . -name "*.py" -not -path "./ops/triton/*" | xargs sed -i \
+    's/import Fused_RoPE_KVcache_store/from ops.triton import fused_rope_kvcache_store as Fused_RoPE_KVcache_store/g'
 
-find . -name "*.py" -not -path "./kernels/*" | xargs sed -i \
-    's/from SwiGLU import/from kernels.swiglu import/g'
-find . -name "*.py" -not -path "./kernels/*" | xargs sed -i \
-    's/import SwiGLU/from kernels import swiglu as SwiGLU/g'
+find . -name "*.py" -not -path "./ops/triton/*" | xargs sed -i \
+    's/from SwiGLU import/from ops.triton.swiglu import/g'
+find . -name "*.py" -not -path "./ops/triton/*" | xargs sed -i \
+    's/import SwiGLU/from ops.triton import swiglu as SwiGLU/g'
 
-find . -name "*.py" -not -path "./kernels/*" | xargs sed -i \
-    's/from store_kvcache import/from kernels.store_kvcache import/g'
-find . -name "*.py" -not -path "./kernels/*" | xargs sed -i \
-    's/import store_kvcache/from kernels import store_kvcache/g'
+find . -name "*.py" -not -path "./ops/triton/*" | xargs sed -i \
+    's/from store_kvcache import/from ops.triton.store_kvcache import/g'
+find . -name "*.py" -not -path "./ops/triton/*" | xargs sed -i \
+    's/import store_kvcache/from ops.triton import store_kvcache/g'
 
 echo "=== Step 8: 为 tests/benchmarks 添加 path ==="
 

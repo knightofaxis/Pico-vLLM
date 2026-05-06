@@ -60,7 +60,7 @@ for i, slot in enumerate(slot_mapping.tolist()):
 # 测试三：store_kvcache 写入后能否从正确位置读回
 # ============================================================
 print("\n=== 测试三：store_kvcache 写入验证 ===")
-from kernels.store_kvcache import store_kvcache
+from ops.triton.store_kvcache import store_kvcache
 
 # 构造已知 k/v
 k = torch.arange(prefill_len * N_KV_HEADS * HEAD_DIM,

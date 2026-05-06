@@ -132,12 +132,9 @@ PicovLLM/
     ├── prefix_cache.py       # Prefix Cache 桥接层
     ├── kv_transfer.py        # PD 分离传输层
     │
-    ├── kernels/              # 5 个手写 Triton kernel
-    │   ├── attention.py
-    │   ├── fused_add_norm.py
-    │   ├── fused_rope_kvcache_store.py
-    │   ├── swiglu.py
-    │   └── store_kvcache.py
+    ├── ops/                  # 后端算子抽象与实现
+    │   ├── triton/           # 手写 Triton 算子实现
+    │   └── torch/            # CPU/Torch 算子占位与实现
     │
     ├── tests/                # 单元测试（有废弃）
     ├── benchmarks/           # 性能测试

@@ -32,6 +32,17 @@ class Engine:
         device = torch.device(device)
         if device.type != "cuda":
             use_cuda_graph = False
+        model_ops = getattr(model, "ops", None)
+        if model_ops is not None:
+            model_ops_device_type = getattr(model_ops, "device_type", None)
+            if model_ops_device_type is not None and model_ops_device_type != device.type:
+                raise ValueError(
+                    f"Model ops backend '{model_ops.name}' targets {model_ops_device_type}, "
+                    f"but Engine device is {device.type}. Build ModelConfig with a matching "
+                    "use_cuda/ops_backend setting."
+                )
+            if not model_ops.supports_cuda_graph:
+                use_cuda_graph = False
 
         self.model = model.to(device)
         # self.sampler = sampler
@@ -115,7 +126,7 @@ class Engine:
         )
         self.static_context_lens = torch.zeros(self.max_batch_size, dtype=torch.int32, device=self.device)
 
-        # 预热（触发 Triton autotune）
+        # 预热（触发后端 autotune/编译）
         for _ in range(3):
             with torch.no_grad():
                 _ = self.model.forward_decode(

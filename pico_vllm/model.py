@@ -6,11 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from cache import KVCache, NaiveKVCache, PagedKVCache
-from kernels.attention import paged_decode_attention, paged_prefill_attention
-from kernels.store_kvcache import store_kvcache
-from RMSNorm import FastRMSNorm
-from kernels.swiglu import fused_swiglu
-from kernels.fused_rope_kvcache_store import fused_decode_rope_and_cache
+from ops import OpsBackend, get_ops_backend
 
 @dataclass
 class ModelConfig:
@@ -27,6 +23,7 @@ class ModelConfig:
 
     #### 动态参数 ####
     use_cuda: bool | None = None
+    ops_backend: str = "auto"
     tp_size: int = 1
     tp_rank: int = 0
     tp_group: object = None
@@ -61,17 +58,6 @@ class ModelConfig:
     @property
     def local_intermediate_size(self):
         return self.intermediate_size // self.tp_size
-
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x):
-        # x: (B, seq, hidden_size)
-        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return x * rms * self.weight
 
 class RoPE(nn.Module):
     cos_table: torch.Tensor  # 类型声明，告诉 Pylance 这个属性存在
@@ -134,13 +120,14 @@ class RoPE(nn.Module):
 class GQAAttention(nn.Module):
     """Grouped-Query Attention：融合 RoPE + KV cache 写入 + paged attention。
 
-    prefill 用 Triton paged_prefill，decode 用 paged_decode；两条路径共享 KV cache
+    prefill 用 paged_prefill，decode 用 paged_decode；两条路径共享 KV cache
     写入 kernel。TP 场景下 o_proj 输出会做一次 all_reduce。
     """
     layer_idx: Tensor
-    def __init__(self, cfg: ModelConfig, layer_idx):
+    def __init__(self, cfg: ModelConfig, layer_idx, ops: OpsBackend):
         super().__init__()
         self.cfg = cfg
+        self.ops = ops
         self.register_buffer(
             'layer_idx', 
             torch.tensor(layer_idx, dtype=torch.int32), 
@@ -165,13 +152,13 @@ class GQAAttention(nn.Module):
         q: (B, seq_len, n_heads, head_dim)  （目前 B=1）
         kv_cache_k/v: 已经写入 cache
         
-        新接口：调用 paged_prefill_attention
+        新接口：调用 backend paged_prefill_attention
         """
         B, seq_len, _, _ = q.shape
         # 打平成 (total_tokens, n_heads, head_dim)
         q_flat = q.reshape(B * seq_len, self.cfg.local_num_attention_heads, self.cfg.head_dim)
         
-        out = paged_prefill_attention(
+        out = self.ops.paged_prefill_attention(
             q_flat, kv_cache_k, kv_cache_v,
             block_table, context_lens, new_token_lens, q_start_loc,
             MAX_BLOCKS_PER_SEQ=block_table.shape[1],
@@ -184,7 +171,7 @@ class GQAAttention(nn.Module):
         B = q.shape[0]
         q_triton = q.transpose(1, 2)
         
-        out = paged_decode_attention(
+        out = self.ops.paged_decode_attention(
             q_triton, kv_cache_k, kv_cache_v,# type:ignore
             block_table, context_lens,
             MAX_BLOCKS_PER_SEQ=block_table.shape[1],
@@ -222,7 +209,7 @@ class GQAAttention(nn.Module):
         v_flat = v.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
 
         # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
-        store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
+        self.ops.store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
 
         if is_prefill:
             output = self._prefill_attention(q, kv_cache_k, kv_cache_v,
@@ -264,7 +251,7 @@ class GQAAttention(nn.Module):
         v_flat = v.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
 
         # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
-        store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
+        self.ops.store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
 
         output = self._prefill_attention(q, kv_cache_k, kv_cache_v,
                     block_table, context_lens, new_token_lens, q_start_loc)
@@ -294,8 +281,8 @@ class GQAAttention(nn.Module):
         k = k.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
         v = v.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
 
-        # RoPE + KV cache 写入 合并在一个 Triton kernel 里
-        q_rot = fused_decode_rope_and_cache(
+        # RoPE + KV cache 写入可由后端融合
+        q_rot = self.ops.decode_rope_and_cache(
             q, k, v, cos, sin, 
             kv_cache_k, kv_cache_v, 
             slot_mapping,
@@ -310,10 +297,11 @@ class GQAAttention(nn.Module):
         return output
     
 class SwiGLUFFN(nn.Module):
-    """SwiGLU FFN：gate 与 up 投影合并成一次 matmul，decode 路径用 Triton 融合激活。"""
-    def __init__(self, cfg: ModelConfig):
+    """SwiGLU FFN：gate 与 up 投影合并成一次 matmul，decode 路径可使用后端融合激活。"""
+    def __init__(self, cfg: ModelConfig, ops: OpsBackend):
         super().__init__()
         self.cfg = cfg
+        self.ops = ops
         self.gate_up_proj = nn.Linear(
             cfg.hidden_size, cfg.local_intermediate_size * 2, bias=False
         )
@@ -333,8 +321,8 @@ class SwiGLUFFN(nn.Module):
             # 1. 跑一次大矩阵乘法 (GEMV/GEMM)，算出 gate_up
             gate_up = self.gate_up_proj(x)
             
-            # 2. 调用手写 Triton 算子，零碎片、零中间变量完成 SwiGLU
-            activated = fused_swiglu(gate_up)
+            # 2. 调用后端算子，零碎片、零中间变量完成 SwiGLU
+            activated = self.ops.swiglu(gate_up)
             
             # 3. 再跑一次下采样矩阵乘法
             output = self.down_proj(activated)
@@ -347,14 +335,15 @@ class SwiGLUFFN(nn.Module):
 #############################################################
 class TransformerBlock(nn.Module):
     """单个 Transformer 层：pre-norm + GQA + pre-norm + SwiGLU-FFN，带残差相加。"""
-    def __init__(self, cfg: ModelConfig, layer_idx):
+    def __init__(self, cfg: ModelConfig, layer_idx, ops: OpsBackend):
         super().__init__()
         self.cfg = cfg
         self.layer_idx = layer_idx
-        self.attn = GQAAttention(cfg, layer_idx=layer_idx)
-        self.ffn = SwiGLUFFN(cfg)
-        self.norm1 = FastRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.norm2 = FastRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.ops = ops
+        self.attn = GQAAttention(cfg, layer_idx=layer_idx, ops=ops)
+        self.ffn = SwiGLUFFN(cfg, ops=ops)
+        self.norm1 = ops.create_rms_norm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.norm2 = ops.create_rms_norm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
     def forward(self, x, cos, sin,
                 kv_cache_k: Tensor,   # 当前层的 slice: (num_blocks, n_kv_heads, block_size, head_dim)
@@ -410,10 +399,14 @@ class Qwen25_15B(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
+        self.ops = get_ops_backend(cfg.device, cfg.ops_backend)
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.rope = RoPE(cfg.head_dim, cfg.rope_theta)
-        self.layers = nn.ModuleList([TransformerBlock(cfg, layer_idx=i) for i in range(cfg.num_hidden_layers)])
-        self.norm = FastRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.layers = nn.ModuleList([
+            TransformerBlock(cfg, layer_idx=i, ops=self.ops)
+            for i in range(cfg.num_hidden_layers)
+        ])
+        self.norm = self.ops.create_rms_norm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         if not cfg.tie_word_embeddings:
             self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         else:
